@@ -1,0 +1,14 @@
+# Ruído do Finder — vaza nomes de arquivos que já estiveram na pasta.
+.DS_Store
+
+# Permissões locais do Claude Code: caminhos absolutos da sua máquina, nomes de
+# projeto e histórico do que você investigou. Não é segredo, é impressão digital.
+.claude/settings.local.json
+
+# Binário compilado. Quem clona roda ./build.sh — ninguém deve confiar num blob
+# assinado ad-hoc que não pode verificar.
+ClaudeBarLocal.app/
+
+# Artefatos soltos de compilação/experimento na raiz.
+*.o
+*.dSYM/

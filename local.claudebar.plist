@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.claudebar</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/ClaudeBarLocal.app/Contents/MacOS/ClaudeBarLocal</string>
+  </array>
+  <!-- Sobe no login. KeepAlive false: se voce sair pelo menu, fica saido. -->
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+  <key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>
