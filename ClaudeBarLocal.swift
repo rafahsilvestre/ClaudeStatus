@@ -218,11 +218,18 @@ struct Limit {
     var pct: Double
     var resetsAt: Date?
     var severity: Severity
+    /// `resetsAt` foi deduzido do historico, nao lido de um campo. Vale um "~"
+    /// na tela: a margem e de minutos (ver PlanHistory.inferReset), o suficiente
+    /// para "faltam 2h" e de menos para "faltam 12min".
+    var resetsAtIsEstimate = false
 
     /// A janela virou depois que o snapshot foi tirado: a porcentagem nao vale
     /// mais. Melhor dizer "reiniciou" que repetir um 85% que ja nao existe.
+    ///
+    /// Estimativa nao derruba porcentagem: errar dez minutos para menos apagaria
+    /// da barra um numero que ainda vale. Quem estima so adianta o countdown.
     var rolledOver: Bool {
-        guard let r = resetsAt else { return false }
+        guard let r = resetsAt, !resetsAtIsEstimate else { return false }
         return r <= Date()
     }
 }
@@ -430,8 +437,9 @@ private enum UsageCache {
 /// fazer.
 ///
 /// Duas limitacoes, ambas de formato e nao de bug:
-///   - so porcentagem. Nao ha `resets_at` -- quem publica precisa herdar a
-///     agenda de outro snapshot (ver Store.publishUsage).
+///   - so porcentagem. Nao ha `resets_at` -- quem publica herda a agenda de
+///     outro snapshot, e na falta dela deduz a da janela de 5h da propria serie
+///     (ver inferReset).
 ///   - so anda com o app aberto. Fechado, ou maquina dormindo, a ultima amostra
 ///     envelhece e perde para as outras fontes na comparacao por carimbo.
 private enum PlanHistory {
@@ -442,18 +450,26 @@ private enum PlanHistory {
     private static let fiveHourKey = "fh"
     private static let sevenDayKey = "sd"
 
+    /// Duracao da janela curta. Nao sai do arquivo -- e a regra do plano.
+    private static let window: TimeInterval = 5 * 3600
+
+    /// Buraco na serie que invalida a deducao. O app amostra a cada 300s; um vao
+    /// maior que este significa app fechado ou maquina dormindo, e ai uma janela
+    /// pode ter virado inteira sem ninguem ver -- inclusive a que estamos
+    /// tentando datar.
+    private static let maxGap: TimeInterval = 30 * 60
+
     static func read(at url: URL) -> Usage {
         guard let data = try? Data(contentsOf: url),
               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let samples = root["samples"] as? [[String: Any]]
         else { return Usage() }
 
-        // max(by:) e nao last: na pratica o arquivo e cronologico, mas nada no
-        // formato promete isso, e uma amostra fora de ordem mostraria numero
-        // velho como se fosse o atual.
-        guard let newest = samples.max(by: { stamp($0) < stamp($1) }),
-              stamp(newest) > 0
-        else { return Usage() }
+        // Ordenado, e nao max(by:): na pratica o arquivo e cronologico, mas nada
+        // no formato promete isso -- uma amostra fora de ordem mostraria numero
+        // velho como se fosse o atual, e quebraria a leitura da serie abaixo.
+        let ordered = samples.filter { stamp($0) > 0 }.sorted { stamp($0) < stamp($1) }
+        guard let newest = ordered.last else { return Usage() }
 
         // v2 aninha as porcentagens em `u`; v1 deixa na raiz da amostra.
         let vals = (newest["u"] as? [String: Any]) ?? newest
@@ -462,15 +478,72 @@ private enum PlanHistory {
         u.source = .planHistory
         u.at = Date(timeIntervalSince1970: stamp(newest) / 1000)
         if let p = Parse.pct(vals[fiveHourKey]) {
-            u.fiveHour = Limit(pct: p, resetsAt: nil, severity: .fromPct(p))
+            let guess = inferReset(ordered)
+            u.fiveHour = Limit(pct: p, resetsAt: guess, severity: .fromPct(p),
+                               resetsAtIsEstimate: guess != nil)
         }
         if let p = Parse.pct(vals[sevenDayKey]) {
+            // A janela de 7 dias fica de fora de proposito: ela quase nunca
+            // zera nesta serie, e sem uma borda observada a mesma conta viraria
+            // extrapolacao de dias a partir de nada.
             u.sevenDay = Limit(pct: p, resetsAt: nil, severity: .fromPct(p))
         }
         // Sem nenhum dos dois o carimbo sozinho nao vale nada -- e venceria a
         // comparacao por frescor sem ter numero para mostrar.
         guard u.fiveHour != nil || u.sevenDay != nil else { return Usage() }
         return u
+    }
+
+    /// Deduz o fim da janela de 5h a partir da propria serie.
+    ///
+    /// A janela nao corre em grade fixa: ela ancora no **primeiro uso** depois de
+    /// zerar e morre 5h depois. Isso e visivel aqui -- a corrida atual de
+    /// amostras com uso > 0 comeca justamente naquele primeiro uso, entao o
+    /// reset e o inicio da corrida mais 5h.
+    ///
+    /// Medido contra os 8 ultimos resets desta serie e contra o
+    /// `five_hour_resets_at` que a statusline gravou em 31/07: erro de -10 a
+    /// +2 min, mediana -7. O sinal e sistematico e tem causa conhecida -- com
+    /// amostragem de 300s o primeiro uso cai em algum ponto *antes* da amostra
+    /// que o revela, entao a estimativa adianta. Adiantar e o lado certo de
+    /// errar: o countdown vence antes da janela, nunca depois.
+    ///
+    /// Devolve nil em vez de chutar quando a serie nao sustenta a conta.
+    private static func inferReset(_ ordered: [[String: Any]]) -> Date? {
+        guard let last = ordered.last, (pct(last) ?? 0) > 0 else { return nil }
+
+        // Anda para tras enquanto houver uso, ate achar a amostra zerada que
+        // antecede a corrida. Amostra sem `fh` nao e zero: e ausencia de dado, e
+        // seguir por cima dela dataria a janela errada.
+        var i = ordered.count - 1
+        while i >= 0 {
+            guard let v = pct(ordered[i]) else { return nil }
+            if v == 0 { break }
+            i -= 1
+        }
+        // A corrida encosta no comeco do arquivo: o inicio real ficou fora da
+        // janela de 30 dias que o app guarda, e nao ha o que datar.
+        guard i >= 0, i + 1 < ordered.count else { return nil }
+
+        let start = Date(timeIntervalSince1970: stamp(ordered[i + 1]) / 1000)
+
+        // Serie continua do inicio da corrida ate agora, senao a corrida pode
+        // estar costurando duas janelas com o app fechado no meio.
+        for j in i..<(ordered.count - 1) {
+            let gap = (stamp(ordered[j + 1]) - stamp(ordered[j])) / 1000
+            guard gap <= maxGap else { return nil }
+        }
+
+        let reset = start.addingTimeInterval(window)
+        // Ja passou da hora e a serie nao mostrou o zero: quem esta velha e a
+        // ultima amostra, nao a janela. Sem data e melhor que data vencida.
+        guard reset > Date() else { return nil }
+        return reset
+    }
+
+    /// Porcentagem da janela de 5h de uma amostra, nos dois formatos.
+    private static func pct(_ sample: [String: Any]) -> Double? {
+        Parse.pct(((sample["u"] as? [String: Any]) ?? sample)[fiveHourKey])
     }
 
     /// Epoch em milissegundos.
@@ -692,11 +765,15 @@ final class Store: ObservableObject {
     /// Contagem regressiva ate a janela de 5h virar. Minutos abaixo de uma hora,
     /// senao a barra ficaria mostrando "0h" por 59 minutos.
     private var resetText: String {
-        guard let at = usage.fiveHour?.resetsAt else { return "" }
+        guard let five = usage.fiveHour, let at = five.resetsAt else { return "" }
         let secs = at.timeIntervalSinceNow
         guard secs > 0 else { return "0m" }
-        if secs < 3600 { return "\(Int(secs / 60))m" }
-        return "\(Int(secs / 3600))h\(String(format: "%02d", Int(secs.truncatingRemainder(dividingBy: 3600) / 60)))"
+        // Data deduzida do historico erra minutos (ver PlanHistory.inferReset).
+        // O til custa uns pontos de largura e evita a barra afirmar "12m" quando
+        // o que ela sabe e "por volta de".
+        let tilde = five.resetsAtIsEstimate ? "~" : ""
+        if secs < 3600 { return "\(tilde)\(Int(secs / 60))m" }
+        return "\(tilde)\(Int(secs / 3600))h\(String(format: "%02d", Int(secs.truncatingRemainder(dividingBy: 3600) / 60)))"
     }
 
     /// Cor de texto da menu bar. Padrao e `labelColor` -- um numero tranquilo
@@ -853,11 +930,37 @@ final class Store: ObservableObject {
 
         // resets_at e agenda, nao medicao: herdar nao inventa uso nenhum, so
         // mantem viva uma data que a fonte vencedora nao transporta.
-        if best.fiveHour != nil, best.fiveHour?.resetsAt == nil {
-            best.fiveHour?.resetsAt = byFreshness.compactMap { $0.fiveHour?.resetsAt }.first
+        //
+        // Mas data vencida nao e agenda, e entulho -- e herdar uma marca o
+        // vencedor como `rolledOver`, o que apaga a porcentagem da menu bar. Era
+        // assim que o robo ficava sozinho na barra sem estar acontecendo nada:
+        // maquina parada, statusline sem reescrever `usage.json` desde o ultimo
+        // uso do Claude Code, e o historico do app nativo -- fresco, com numero
+        // bom -- vestindo um `resets_at` de dois dias atras. Preferir a fonte
+        // mais fresca *que ainda tenha data no futuro*; nenhuma tendo, publicar
+        // sem countdown, que e a verdade: uso conhecido, agenda desconhecida.
+        //
+        // Estimativa (PlanHistory.inferReset) conta como ausencia aqui: se
+        // alguem tem a data de verdade, ela ganha. A deduzida so fica quando e
+        // tudo o que ha.
+        let now = Date()
+        let exact = { (pick: (Usage) -> Limit?) -> Date? in
+            byFreshness.compactMap { u -> Date? in
+                guard let l = pick(u), !l.resetsAtIsEstimate else { return nil }
+                return l.resetsAt
+            }.first { $0 > now }
         }
-        if best.sevenDay != nil, best.sevenDay?.resetsAt == nil {
-            best.sevenDay?.resetsAt = byFreshness.compactMap { $0.sevenDay?.resetsAt }.first
+        if best.fiveHour != nil, best.fiveHour?.resetsAt == nil || best.fiveHour?.resetsAtIsEstimate == true {
+            if let d = exact({ $0.fiveHour }) {
+                best.fiveHour?.resetsAt = d
+                best.fiveHour?.resetsAtIsEstimate = false
+            }
+        }
+        if best.sevenDay != nil, best.sevenDay?.resetsAt == nil || best.sevenDay?.resetsAtIsEstimate == true {
+            if let d = exact({ $0.sevenDay }) {
+                best.sevenDay?.resetsAt = d
+                best.sevenDay?.resetsAtIsEstimate = false
+            }
         }
 
         // Creditos extra so sao herdados quando o vencedor nem tem o campo no
@@ -2111,7 +2214,11 @@ struct LimitBar: View {
                 if l.rolledOver {
                     Text("janela reiniciada").font(.caption2).foregroundStyle(.secondary)
                 } else if let r = l.resetsAt {
-                    Text("reinicia \(r, style: .relative)")
+                    // O "~" nao e enfeite: a data deduzida erra minutos, e um
+                    // countdown ao segundo sem ele prometeria precisao que nao
+                    // existe.
+                    Text(l.resetsAtIsEstimate ? "reinicia ~\(r, style: .relative)"
+                                              : "reinicia \(r, style: .relative)")
                         .font(.caption2).foregroundStyle(.secondary)
                 }
             }

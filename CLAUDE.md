@@ -70,6 +70,17 @@ são **herdados** do snapshot mais recente que os tenha. E a herança de
 campo e não mandou, o silêncio é a resposta — repescar o valor antigo faria o
 painel mentir sobre crédito disponível.
 
+Duas regras sobre `resets_at`, ambas custaram um sintoma visível:
+
+- **Só se herda data no futuro.** Uma vencida marca o limite como `rolledOver` e
+  apaga a porcentagem da menu bar — era o robô aparecendo sozinho com a máquina
+  parada, escondendo um número fresco atrás do `usage.json` congelado.
+- **`PlanHistory.inferReset` deduz a janela de 5h da própria série** (início da
+  corrida de amostras com uso > 0, mais 5h; erro medido de −10 a +2 min). Data
+  deduzida vem com `resetsAtIsEstimate`, aparece com `~`, nunca dispara
+  `rolledOver`, e perde para qualquer data exata. Sem série que a sustente,
+  devolve nil — o painel fica sem countdown, que é a verdade.
+
 Rede: `maybeFetchAPI()` dispara ao **abrir o painel** (piso de 60s), não por
 polling. O timer de 300s fica em silêncio enquanto o histórico do app nativo
 estiver fresco (`passiveFresh`). Um 429 vira backoff de 10→60 min e o painel se

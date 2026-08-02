@@ -16,13 +16,13 @@ a API da Claude com o seu `sessionKey` — credencial de conta inteira, guardada
 num binário fechado que se atualiza sozinho. Aqui você compila o código e sabe
 exatamente o que ele faz.
 
-Três fontes, da mais viva para a mais teimosa:
+Quatro fontes, da mais viva para a mais teimosa:
 
 | Componente | Lê | Escreve | Rede |
 |---|---|---|---|
 | `statusline.py` | stdin do Claude Code | `~/.claude/claude-bar/` | nenhuma |
 | `hook.py` | stdin do Claude Code | `~/.claude/claude-bar/` | nenhuma |
-| `ClaudeBarLocal.app` | Keychain (via `security`) + `~/.claude.json` + `~/.claude/claude-bar/` + `~/.claude/projects/**/*.jsonl` + `~/.claude/ide/*.lock` | `~/Library/Preferences/local.claudebar.plist` | 1 `GET`, a cada 5 min |
+| `ClaudeBarLocal.app` | Keychain (via `security`) + `~/.claude.json` + `~/.claude/claude-bar/` + `~/.claude/projects/**/*.jsonl` + `~/.claude/ide/*.lock` + `~/Library/Application Support/Claude/plan-usage-history.json` | `~/Library/Preferences/local.claudebar.plist` | 1 `GET`, a cada 5 min |
 
 Três subprocessos, os três somente-leitura: `/usr/bin/security` para o token (a
 cada 5 min); `/bin/ps` e `/usr/sbin/lsof` para descobrir a janela do editor que
@@ -57,11 +57,66 @@ Claude Code guarda ali a última resposta crua de `/api/oauth/usage`, com
 python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude.json')))['cachedUsageUtilization']['fetchedAtMs'])"
 ```
 
-**3. `usage.json` — último recurso**, escrito pela statusline a partir de
+**3. `plan-usage-history.json` — o app nativo trabalhando de graça.** O app do
+Claude poleia o endpoint de uso sozinho a cada 300s e guarda 30 dias de amostras
+em `~/Library/Application Support/Claude/`. Ler custa zero requisição e zero
+credencial. Só anda com o app aberto — fechado, a última amostra envelhece e
+perde para as outras na comparação por carimbo.
+
+> **É esta fonte que enxerga o app nativo.** O limite de 5h/7d é da conta, não do
+> Claude Code: o que você gasta conversando no app nativo ou na web entra no
+> mesmo balde e aparece aqui. O painel de **custo** é outra história — ele conta
+> tokens de transcript, e o chat do app nativo não deixa transcript em disco
+> (conversa mora no servidor). Percentual vê tudo; custo em dólar vê só o CLI.
+
+**4. `usage.json` — último recurso**, escrito pela statusline a partir de
 `rate_limits.five_hour`/`seven_day`. A statusline **só roda no CLI**: a extensão
 do VS Code não executa `statusLine`.
 
-O painel mostra sempre a mais fresca das três, com origem e idade.
+O painel mostra sempre a mais fresca das quatro, com origem e idade —
+**comparação por carimbo, nunca prioridade fixa**, para o número nunca andar para
+trás.
+
+### Quem vence manda no número, não na agenda
+
+O vencedor por frescor manda na **porcentagem**. Campos que o formato dele não
+carrega — `resets_at`, créditos extra — são herdados do snapshot mais recente que
+os tenha. Duas regras que parecem detalhe e não são:
+
+- **Data de reset vencida não se herda.** O histórico do app nativo só traz
+  porcentagem, e a única fonte com `resets_at` é a statusline — que congela
+  quando você não usa o CLI. Herdar uma data do passado marca o limite como
+  "janela reiniciada" e **apaga a porcentagem da menu bar**: robô sozinho na
+  barra, com a máquina parada e um número perfeitamente bom escondido atrás de
+  uma agenda morta. Só entra data no futuro.
+- **`extra_usage` só é herdado de quem não podia mandá-lo.** Se a fonte
+  *carregava* o campo e veio vazia, o silêncio é a resposta — repescar o valor
+  antigo faria o painel mentir sobre crédito disponível.
+
+### O `~` do countdown
+
+Sem o CLI aberto ninguém tem `resets_at`, mas a série do app nativo tem o
+suficiente para deduzi-lo. A janela de 5h não corre em grade fixa: ela ancora no
+**primeiro uso** depois de zerar e morre 5h depois. Esse instante é visível — é o
+começo da corrida atual de amostras com uso > 0.
+
+Medido contra os 8 últimos resets de uma série real e contra o
+`five_hour_resets_at` que a statusline havia gravado: **erro de −10 a +2 min,
+mediana −7**. O sinal é sistemático e tem causa conhecida — com amostragem de
+300s o primeiro uso cai antes da amostra que o revela, então a estimativa
+adianta. Adiantar é o lado certo de errar: o countdown vence antes da janela,
+nunca depois.
+
+Por isso a data deduzida aparece com til (`~2h30`) e **nunca** marca uma janela
+como reiniciada — errar dez minutos para menos apagaria da barra um número que
+ainda vale. Se qualquer fonte tiver a data de verdade, ela ganha da estimativa. E
+a dedução devolve *nada* em vez de chutar quando a série não a sustenta: uso
+atual zerado, buraco maior que 30 min na série (app fechado, máquina dormindo),
+amostra sem o campo, corrida que encosta na borda dos 30 dias, ou prazo que já
+venceu sem o zero ter sido observado.
+
+A janela de 7 dias fica de fora de propósito: ela quase nunca zera na série, e
+sem uma borda observada a mesma conta viraria extrapolação a partir de nada.
 
 ### Por que não aparece o diálogo do Keychain
 
