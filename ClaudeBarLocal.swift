@@ -173,6 +173,23 @@ extension NSColor {
             ? NSColor(srgbRed: 1.00, green: 0.45, blue: 0.39, alpha: 1)
             : NSColor(srgbRed: 0.72, green: 0.08, blue: 0.05, alpha: 1)
     }
+
+    /// Porcentagem com dado velho (ver `Usage.isStale`).
+    ///
+    /// `secondaryLabelColor` e o gesto obvio e o errado aqui: ele esmaece por
+    /// alpha, e o que fica atras do numero na menu bar e o wallpaper, nao uma
+    /// superficie controlada. Sobre um fundo de luminancia parecida o composto
+    /// simplesmente some -- medido com wallpaper azul medio, o "0%" ficou
+    /// ilegivel enquanto os vizinhos da barra continuavam nitidos.
+    ///
+    /// Entao o esmaecido e feito com cor opaca: o numero fica visivelmente mais
+    /// apagado que `labelColor` sem deixar o fundo atravessar. Como em
+    /// `barCritical`, de que lado ele apaga depende da aparencia da barra.
+    static let barStale = NSColor(name: "barStale") { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(white: 0.74, alpha: 1)
+            : NSColor(white: 0.36, alpha: 1)
+    }
 }
 
 enum Severity: String {
@@ -785,7 +802,7 @@ final class Store: ObservableObject {
     /// que ele carrega -- a porcentagem passaria a mentir sobre a severidade do
     /// uso justamente quando ela esta em vermelho.
     var menuTextColor: NSColor {
-        if usage.isStale { return .secondaryLabelColor }
+        if usage.isStale { return .barStale }
         guard let five = usage.fiveHour, !five.rolledOver else { return .labelColor }
         switch five.severity {
         case .critical: return .barCritical
