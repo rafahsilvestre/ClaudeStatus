@@ -516,7 +516,13 @@ O item mostra sempre o robô; o que vai escrito ao lado é escolha sua, em
 | Só o robô | nada além do ícone |
 | Uso da sessão (5h) (padrão) | `54%` |
 | Tempo até reiniciar | `2h14` — contagem regressiva da janela de 5h |
+| Uso + tempo até reiniciar | `54% \| 2h14` — os dois acima lado a lado |
 | Custo de hoje | `$32.63` |
+
+No modo combinado o separador só aparece quando os dois lados existem: com o
+limite virado sobra o relógio, sem `resets_at` sobra a porcentagem. É o modo mais
+largo da lista — vale a pena se você tem espaço na barra, incomoda se a sua já
+está cheia.
 
 Os dígitos são monoespaçados de propósito: sem isso o item mudaria de largura a
 cada ponto percentual e empurraria os vizinhos da barra.

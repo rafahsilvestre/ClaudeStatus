@@ -769,6 +769,12 @@ final class Store: ObservableObject {
             return percentText
         case .resetTimer:
             return resetText
+        case .percentAndReset:
+            // Cada metade ja sabe sumir sozinha -- limite virado apaga a
+            // porcentagem, ausencia de resets_at apaga o relogio. O separador
+            // so entra quando as duas sobreviveram; montar a string com ele
+            // fixo deixaria "| 1h34" ou "54% |" na barra, que le como bug.
+            return [percentText, resetText].filter { !$0.isEmpty }.joined(separator: " | ")
         case .costToday:
             return Money.short(cost.report(days: 1).total.cost)
         }
@@ -1954,16 +1960,17 @@ private final class CostScanner {
 
 /// Modo de exibicao do item da menu bar.
 enum BarMode: String, CaseIterable, Identifiable {
-    case iconOnly, percent, resetTimer, costToday
+    case iconOnly, percent, resetTimer, percentAndReset, costToday
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
-        case .iconOnly:   return "Só o robô"
-        case .percent:    return "Uso da sessão (5h)"
-        case .resetTimer: return "Tempo até reiniciar"
-        case .costToday:  return "Custo de hoje"
+        case .iconOnly:        return "Só o robô"
+        case .percent:         return "Uso da sessão (5h)"
+        case .resetTimer:      return "Tempo até reiniciar"
+        case .percentAndReset: return "Uso + tempo até reiniciar"
+        case .costToday:       return "Custo de hoje"
         }
     }
 }
