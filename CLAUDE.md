@@ -34,11 +34,19 @@ swiftc -typecheck -parse-as-library -target arm64-apple-macos13.0 ClaudeBarLocal
 # relançar depois de compilar
 pkill -f "ClaudeBarLocal.app/Contents/MacOS/ClaudeBarLocal"; open ClaudeBarLocal.app
 
+git config core.hooksPath .githooks   # uma vez por clone; veja abaixo
+
 # ver o JSON cru que o Claude Code manda nos hooks/statusline desta versão
 touch ~/.claude/claude-bar/DEBUG   # ... use o Claude Code ... depois:
 python3 -m json.tool < ~/.claude/claude-bar/debug.jsonl
 rm ~/.claude/claude-bar/DEBUG ~/.claude/claude-bar/debug.jsonl
 ```
+
+Com auto-start ligado, quem roda é `/Applications/ClaudeBarLocal.app`, não o
+bundle da pasta — `./build.sh` sozinho não alcança o `launchd`.
+`.githooks/post-commit` propaga a cada commit (rebuild + `/Applications` +
+`kickstart`), mas só se `ClaudeBarLocal.swift` ou os `.py` mudarem, e nunca
+durante rebase/merge. Detalhes e justificativas na seção 5 do README.
 
 **Não há suíte de testes.** A verificação é feita assim:
 

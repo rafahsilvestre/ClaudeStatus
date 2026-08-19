@@ -303,6 +303,40 @@ cp local.claudebar.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.claudebar.plist
 ```
 
+### 5. Propagar cada commit para o app que roda (opcional)
+
+Com o auto-start ligado, quem sobe no login é `/Applications/ClaudeBarLocal.app`
+— e `./build.sh` sozinho atualiza apenas o bundle da pasta do repositório. O
+sintoma é silencioso e confunde: você edita, compila, e o ícone da menu bar
+continua sendo o de antes, porque o `launchd` nunca ouviu falar do bundle novo.
+
+`.githooks/post-commit` fecha essa distância. Ative uma vez por clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+A cada commit ele olha o que mudou e faz só o necessário: `statusline.py` ou
+`hook.py` mudaram, recopia para `~/.claude/claude-bar`; `ClaudeBarLocal.swift`
+mudou, roda o `build.sh`, substitui o bundle em `/Applications` e reinicia o
+serviço. Commit que mexe só em documentação não recompila nada.
+
+Três detalhes que o hook não improvisa:
+
+- **Não chama o `install.sh`.** Ele refaria o merge do `settings.json` e
+  reinstalaria o LaunchAgent a cada commit; o hook toca apenas o que muda de um
+  commit para o outro.
+- **Reinicia com `launchctl kickstart -k`, não com `open`.** O processo precisa
+  continuar sendo filho do agent — um `open` avulso ficaria órfão e o `launchd`
+  o mataria no login seguinte.
+- **Sai na hora durante rebase, merge e cherry-pick.** O `post-commit` dispara
+  uma vez por commit replicado: sem essa guarda, um rebase de dez commits
+  recompilaria dez vezes e piscaria a menu bar junto.
+
+O hook nunca falha o commit — quando o `build.sh` quebra, ele avisa que
+`/Applications` ficou na versão anterior e devolve `0`. Note que `core.hooksPath`
+é configuração local: ela não vem no clone, e por isso o passo acima existe.
+
 ---
 
 ## Estados

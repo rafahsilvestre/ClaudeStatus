@@ -1,0 +1,73 @@
+#!/bin/bash
+# Propaga o commit para o que esta rodando de verdade: o bundle em
+# /Applications, que e o caminho do LaunchAgent (local.claudebar.plist).
+#
+# Sem isto, ./build.sh atualiza so o .app da pasta do repo e o launchd continua
+# subindo a versao antiga no login -- foi exatamente o sintoma que motivou o
+# hook. Nao chamamos install.sh porque ele refaz settings.json e reinstala o
+# LaunchAgent a cada commit; aqui so o que muda de commit para commit e tocado.
+#
+# Nunca falha o commit: o commit ja esta escrito quando este hook roda, entao
+# qualquer erro daqui vira aviso, nunca exit != 0.
+
+REPO="$(git rev-parse --show-toplevel)"
+cd "$REPO" || exit 0
+
+APP="ClaudeBarLocal.app"
+INSTALLED="/Applications/$APP"
+STATE_DIR="$HOME/.claude/claude-bar"
+LABEL="local.claudebar"
+
+# Guarda: em rebase/merge/cherry-pick o post-commit dispara por commit
+# replicado. Rebuildar em cada um custa ~10s a toa e reinicia a menu bar N
+# vezes; propaga so quando a arvore volta a um estado estavel.
+GIT_DIR="$(git rev-parse --git-dir)"
+if [ -d "$GIT_DIR/rebase-merge" ] || [ -d "$GIT_DIR/rebase-apply" ] \
+   || [ -f "$GIT_DIR/MERGE_HEAD" ] || [ -f "$GIT_DIR/CHERRY_PICK_HEAD" ]; then
+  exit 0
+fi
+
+changed="$(git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null)"
+
+say() { printf '\033[2mclaude-bar:\033[0m %s\n' "$1"; }
+
+# --- scripts: baratos, copia sempre que mudarem -----------------------------
+if grep -qE '^(statusline|hook)\.py$' <<<"$changed"; then
+  if mkdir -p "$STATE_DIR" \
+     && chmod 700 "$STATE_DIR" \
+     && cp statusline.py hook.py "$STATE_DIR/" \
+     && chmod +x "$STATE_DIR/statusline.py" "$STATE_DIR/hook.py"; then
+    say "scripts -> $STATE_DIR"
+  else
+    say "aviso: falha ao copiar os scripts para $STATE_DIR" >&2
+  fi
+fi
+
+# --- app: so recompila se o fonte mudou -------------------------------------
+grep -qx 'ClaudeBarLocal.swift' <<<"$changed" || exit 0
+
+say "ClaudeBarLocal.swift mudou, recompilando..."
+if ! ./build.sh >/dev/null 2>&1; then
+  say "aviso: build.sh falhou -- /Applications segue na versao anterior." >&2
+  say "       rode ./build.sh direto para ver o erro." >&2
+  exit 0
+fi
+
+# rm antes do cp: cp -R por cima de bundle existente mistura arquivos de duas
+# compilacoes se algum nome sumir entre elas.
+if ! (rm -rf "$INSTALLED" && cp -R "$APP" /Applications/); then
+  say "aviso: nao consegui escrever em $INSTALLED." >&2
+  exit 0
+fi
+
+# kickstart -k mata e sobe de novo pelo launchd, entao o processo continua sendo
+# filho do agent (um 'open' avulso nao seria, e o launchd o mataria no proximo
+# login). O servico ja esta bootstrapped desde a instalacao.
+if launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null; then
+  say "/Applications atualizado, app reiniciado."
+else
+  say "aviso: /Applications atualizado, mas o LaunchAgent nao respondeu." >&2
+  say "       rode ./install.sh --autostart para reinstalar o agent." >&2
+fi
+
+exit 0
