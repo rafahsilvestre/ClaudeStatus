@@ -15,7 +15,6 @@ cd "$REPO" || exit 0
 
 APP="ClaudeBarLocal.app"
 INSTALLED="/Applications/$APP"
-STATE_DIR="$HOME/.claude/claude-bar"
 LABEL="local.claudebar"
 
 # Guarda: em rebase/merge/cherry-pick o post-commit dispara por commit
@@ -32,15 +31,21 @@ changed="$(git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null)"
 say() { printf '\033[2mclaude-bar:\033[0m %s\n' "$1"; }
 
 # --- scripts: baratos, copia sempre que mudarem -----------------------------
+#
+# Em toda conta que JA tenha os scripts -- e so nelas. Instalar numa conta nova e
+# decisao do install.sh, que mexe no settings.json dela e pergunta antes; um hook
+# de commit registrando hooks globais numa conta que ninguem pediu seria o tipo de
+# surpresa que este projeto existe para nao dar.
 if grep -qE '^(statusline|hook)\.py$' <<<"$changed"; then
-  if mkdir -p "$STATE_DIR" \
-     && chmod 700 "$STATE_DIR" \
-     && cp statusline.py hook.py "$STATE_DIR/" \
-     && chmod +x "$STATE_DIR/statusline.py" "$STATE_DIR/hook.py"; then
-    say "scripts -> $STATE_DIR"
-  else
-    say "aviso: falha ao copiar os scripts para $STATE_DIR" >&2
-  fi
+  for state in "$HOME"/.claude/claude-bar "$HOME"/.claude-*/claude-bar; do
+    [ -f "$state/hook.py" ] || continue
+    if cp statusline.py hook.py "$state/" \
+       && chmod +x "$state/statusline.py" "$state/hook.py"; then
+      say "scripts -> ${state/#$HOME/~}"
+    else
+      say "aviso: falha ao copiar os scripts para $state" >&2
+    fi
+  done
 fi
 
 # --- app: so recompila se o fonte mudou -------------------------------------

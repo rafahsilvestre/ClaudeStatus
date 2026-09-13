@@ -174,6 +174,20 @@ extension NSColor {
             : NSColor(srgbRed: 0.72, green: 0.08, blue: 0.05, alpha: 1)
     }
 
+    /// Fundo da etiqueta de limite critico.
+    ///
+    /// Pode ser saturada justamente por ser fundo: quem precisa de contraste
+    /// contra o wallpaper e a etiqueta inteira, que e um bloco solido, e o texto
+    /// branco por cima so precisa de contraste contra ela. E o que resolve o
+    /// problema que `barCritical` so ameniza -- vermelho de texto continua
+    /// dependendo de sorte com o papel de parede, e em corpo pequeno (as duas
+    /// linhas do modo "ambas", 8,5pt) a sorte piora.
+    static let barBadge = NSColor(name: "barBadge") { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(srgbRed: 0.86, green: 0.21, blue: 0.17, alpha: 1)
+            : NSColor(srgbRed: 0.76, green: 0.11, blue: 0.09, alpha: 1)
+    }
+
     /// Porcentagem com dado velho (ver `Usage.isStale`).
     ///
     /// `secondaryLabelColor` e o gesto obvio e o errado aqui: ele esmaece por
@@ -225,6 +239,14 @@ struct Session: Identifiable {
     /// Diretorio da sessao. E o que o clique abre, e o que casa a sessao com a
     /// janela do editor.
     let cwd: String
+    /// De qual conta e esta sessao. Nao vem do arquivo: vem do config dir onde o
+    /// arquivo estava, que e a unica coisa que os scripts nao teriam como errar.
+    let accountID: String
+    let accountTag: String
+    /// Config dir da conta. O lock da janela do editor mora em `<config dir>/ide`,
+    /// e cada conta escreve no seu -- procurar no dir errado acharia a janela de
+    /// outra sessao.
+    let configDir: URL
 
     /// O que aparece em destaque na linha. A conversa manda; a pasta e o
     /// fallback, porque duas sessoes na mesma pasta ficariam identicas.
@@ -350,9 +372,173 @@ private enum Parse {
     }
 }
 
-// MARK: - Cache do Claude Code (~/.claude.json)
+// MARK: - Contas
 
-private enum UsageCache {
+/// Uma conta do Claude Code nesta maquina.
+///
+/// O Claude Code separa conta por **config dir**: a padrao usa `~/.claude`, com
+/// o `~/.claude.json` ao lado (fora dela); qualquer outra vive inteira dentro do
+/// `CLAUDE_CONFIG_DIR` apontado -- o `.claude.json` dela, `projects/`, `ide/` e o
+/// `claude-bar/` que os scripts escrevem. E o que faz duas contas caberem neste
+/// app sem nenhuma heuristica: a conta de um dado e o diretorio de onde ele veio,
+/// nunca um palpite sobre qual sessao o produziu.
+struct Account: Identifiable, Equatable {
+    /// `accountUuid` do `oauthAccount`. Sem login feito naquele config dir nao ha
+    /// uuid, e o caminho serve de identidade: nao colide com uuid nenhum e a
+    /// conta continua aparecendo, porque sessao e custo dela ja estao em disco.
+    let id: String
+
+    /// A letra que aparece no painel e na menu bar. "P" e sempre a conta padrao
+    /// -- a que este app ja rastreava quando so existia uma.
+    let tag: String
+
+    /// Email da conta. Cai para o nome do diretorio quando nao da para ler.
+    let name: String
+
+    /// `organizationUuid`. E por ele que as amostras do historico do app nativo,
+    /// carimbadas por org, encontram a conta certa.
+    let org: String?
+
+    let configDir: URL
+    let claudeJSON: URL
+    let isDefault: Bool
+
+    var stateDir: URL { configDir.appendingPathComponent("claude-bar") }
+    var sessionsDir: URL { stateDir.appendingPathComponent("sessions") }
+    var usageFile: URL { stateDir.appendingPathComponent("usage.json") }
+    var projectsDir: URL { configDir.appendingPathComponent("projects") }
+}
+
+enum Accounts {
+    private static let home = FileManager.default.homeDirectoryForCurrentUser
+
+    /// Conta + snapshot do `.claude.json` de cada config dir, com um **unico**
+    /// parse por arquivo: o mesmo JSON carrega a identidade da conta e o
+    /// `cachedUsageUtilization`, e sao ~60KB que o Claude Code reescreve o tempo
+    /// todo -- parsear duas vezes por tick seria pagar dobrado pelo mesmo byte.
+    /// `tags` e `names` sao os apelidos que o dono da maquina deu, por id da
+    /// conta (ver Settings.setLabel). Chegam como parametro em vez de saírem do
+    /// Settings aqui dentro porque esta varredura roda na fila de IO, e ler
+    /// estado observavel fora da main e o tipo de atalho que so quebra em
+    /// producao.
+    static func scan(tags: [String: String] = [:],
+                     names: [String: String] = [:]) -> [(account: Account, snapshot: ClaudeConfig.Snapshot)] {
+        var out: [(account: Account, snapshot: ClaudeConfig.Snapshot)] = []
+        var extras = 0
+        var used = Set<String>()
+
+        for (index, dir) in configDirs().enumerated() {
+            let isDefault = index == 0
+            // A unica assimetria do formato: a conta padrao guarda o .claude.json
+            // ao lado do config dir, nao dentro dele.
+            let json = isDefault ? home.appendingPathComponent(".claude.json")
+                                 : dir.appendingPathComponent(".claude.json")
+            let snapshot = ClaudeConfig.read(at: json)
+
+            // O uuid e a identidade preferida porque sobrevive a mover o config
+            // dir de lugar. A mesma conta logada em dois config dirs repetiria o
+            // uuid, e duas entradas com o mesmo id embaralhariam fontes, custo e
+            // apelidos -- nesse caso o caminho desempata.
+            var id = snapshot.identity?.uuid ?? dir.path
+            if !used.insert(id).inserted { id = dir.path; used.insert(id) }
+
+            let tag: String
+            if isDefault {
+                tag = "P"
+            } else {
+                extras += 1
+                tag = extras == 1 ? "E" : "E\(extras)"
+            }
+
+            out.append((Account(id: id,
+                                tag: tags[id] ?? tag,
+                                name: names[id] ?? snapshot.identity?.email ?? dir.lastPathComponent,
+                                org: snapshot.identity?.org,
+                                configDir: dir,
+                                claudeJSON: json,
+                                isDefault: isDefault),
+                        snapshot))
+        }
+        return out
+    }
+
+    /// Os config dirs, a padrao sempre primeiro.
+    ///
+    /// `CLAUDE_CONFIG_DIR` aceita qualquer caminho, mas o app nao tem como ler o
+    /// ambiente de um shell que ele nao abriu -- entao a busca e por convencao:
+    /// irmaos de `~/.claude` que comecem com `.claude-` e tenham um `.claude.json`
+    /// dentro. E o formato que se usa na pratica (`~/.claude-empresa`), e o custo
+    /// de errar e assimetrico: um config dir fora do $HOME simplesmente nao
+    /// aparece no painel, enquanto adivinhar mais do que isso poria numero de uma
+    /// conta debaixo do nome de outra.
+    ///
+    /// Uma copia de backup com `.claude.json` dentro entraria na lista -- e por
+    /// isso que cada cartao mostra o email da conta, e nao so a letra.
+    private static func configDirs() -> [URL] {
+        let fm = FileManager.default
+        var dirs = [home.appendingPathComponent(".claude")]
+
+        let entries = (try? fm.contentsOfDirectory(at: home,
+                                                   includingPropertiesForKeys: [.isDirectoryKey],
+                                                   options: [])) ?? []
+        for url in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            guard url.lastPathComponent.hasPrefix(".claude-"),
+                  (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
+                  fm.fileExists(atPath: url.appendingPathComponent(".claude.json").path)
+            else { continue }
+            dirs.append(url)
+        }
+        return dirs
+    }
+}
+
+// MARK: - Cache do Claude Code (<config dir>/.claude.json)
+
+/// Quem e a conta daquele config dir. Sai do bloco `oauthAccount`, que o Claude
+/// Code mantem atualizado a cada refresh de perfil.
+struct AccountIdentity {
+    let uuid: String
+    let email: String
+    let org: String?
+}
+
+/// O `.claude.json` de uma conta, lido de uma vez so.
+enum ClaudeConfig {
+
+    struct Snapshot {
+        var identity: AccountIdentity?
+        var usage: UsageCache.Result = .noFile
+    }
+
+    /// Le identidade e `cachedUsageUtilization` do `.claude.json`.
+    ///
+    /// O arquivo tem ~60KB e e reescrito com frequencia pelo proprio Claude Code.
+    /// Ler e parsear a cada tick e barato, mas TEM que ser fora da main thread e
+    /// TEM que tolerar falha: pegar uma escrita pela metade devolve `.unreadable`,
+    /// e quem chama mantem o ultimo valor bom em vez de piscar "sem dado".
+    static func read(at url: URL) -> Snapshot {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return Snapshot(identity: nil, usage: .noFile)
+        }
+        guard let data = try? Data(contentsOf: url),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return Snapshot(identity: nil, usage: .unreadable) }
+
+        return Snapshot(identity: identity(root), usage: UsageCache.read(root))
+    }
+
+    private static func identity(_ root: [String: Any]) -> AccountIdentity? {
+        guard let oauth = root["oauthAccount"] as? [String: Any],
+              let uuid = oauth["accountUuid"] as? String, !uuid.isEmpty
+        else { return nil }
+        let org = oauth["organizationUuid"] as? String
+        return AccountIdentity(uuid: uuid,
+                               email: (oauth["emailAddress"] as? String) ?? uuid,
+                               org: (org?.isEmpty == false) ? org : nil)
+    }
+}
+
+enum UsageCache {
 
     enum Result {
         case success(Usage)
@@ -361,18 +547,8 @@ private enum UsageCache {
         case unreadable
     }
 
-    /// Le `cachedUsageUtilization` do ~/.claude.json.
-    ///
-    /// O arquivo tem ~50KB e e reescrito com frequencia pelo proprio Claude Code.
-    /// Ler e parsear a cada tick e barato, mas TEM que ser fora da main thread e
-    /// TEM que tolerar falha: pegar uma escrita pela metade devolve .unreadable, e
-    /// quem chama mantem o ultimo valor bom em vez de piscar "sem dado".
-    static func read(at url: URL) -> Result {
-        guard FileManager.default.fileExists(atPath: url.path) else { return .noFile }
-        guard let data = try? Data(contentsOf: url),
-              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        else { return .unreadable }
-
+    /// Extrai `cachedUsageUtilization` de um `.claude.json` ja parseado.
+    static func read(_ root: [String: Any]) -> Result {
         guard let cache = root[K.cacheKey] as? [String: Any],
               let util = cache["utilization"] as? [String: Any]
         else { return .noUsageKey }
@@ -476,16 +652,53 @@ private enum PlanHistory {
     /// tentando datar.
     private static let maxGap: TimeInterval = 30 * 60
 
-    static func read(at url: URL) -> Usage {
+    /// Uma serie por organizacao, mais a serie sem carimbo.
+    struct Series {
+        var byOrg: [String: Usage] = [:]
+        /// Serie inteira, e so quando **nenhuma** amostra traz `org` -- formato
+        /// antigo, de quando o app nativo nao carimbava. Vale so para a conta
+        /// padrao: numa maquina de uma conta so nao ha ambiguidade nenhuma, e
+        /// numa de duas o arquivo ja vem carimbado.
+        var legacy: Usage?
+    }
+
+    /// Le o arquivo uma vez e separa as amostras por organizacao.
+    ///
+    /// O filtro por org nao e zelo: o app nativo poleia a conta em que *ele* esta
+    /// logado, e cada amostra diz de qual org ela e. Sem separar, a serie de uma
+    /// conta apareceria debaixo do nome da outra -- e numero errado com cara de
+    /// fresco e o pior estado possivel deste painel, pior que ficar sem fonte.
+    static func read(at url: URL) -> Series {
         guard let data = try? Data(contentsOf: url),
               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let samples = root["samples"] as? [[String: Any]]
-        else { return Usage() }
+        else { return Series() }
 
+        let valid = samples.filter { stamp($0) > 0 }
+        var grouped: [String: [[String: Any]]] = [:]
+        for sample in valid {
+            guard let org = sample["org"] as? String, !org.isEmpty else { continue }
+            grouped[org, default: []].append(sample)
+        }
+
+        var series = Series()
+        if grouped.isEmpty {
+            series.legacy = usage(from: valid)
+            return series
+        }
+        for (org, rows) in grouped {
+            let u = usage(from: rows)
+            if u.at != nil { series.byOrg[org] = u }
+        }
+        return series
+    }
+
+    /// Monta o Usage de uma serie ja separada por conta.
+    private static func usage(from samples: [[String: Any]]) -> Usage {
         // Ordenado, e nao max(by:): na pratica o arquivo e cronologico, mas nada
         // no formato promete isso -- uma amostra fora de ordem mostraria numero
         // velho como se fosse o atual, e quebraria a leitura da serie abaixo.
-        let ordered = samples.filter { stamp($0) > 0 }.sorted { stamp($0) < stamp($1) }
+        let ordered = samples.sorted { stamp($0) < stamp($1) }
         guard let newest = ordered.last else { return Usage() }
 
         // v2 aninha as porcentagens em `u`; v1 deixa na raiz da amostra.
@@ -694,9 +907,30 @@ private enum UsageAPI {
 
 // MARK: - Store
 
+/// Uma linha de texto da menu bar, ja resolvida: o que escrever, em que cor, e
+/// se ela vai dentro de uma etiqueta (e de que cor e o fundo dela).
+struct BarLine {
+    let text: String
+    let color: NSColor
+    /// Fundo da etiqueta. Nil = texto solto sobre o wallpaper.
+    let badge: NSColor?
+}
+
+/// Uma conta com o uso ja resolvido -- e uma destas por cartao do painel.
+struct AccountUsage: Identifiable {
+    let account: Account
+    var usage: Usage
+    var id: String { account.id }
+}
+
 final class Store: ObservableObject {
     @Published var sessions: [Session] = []
-    @Published var usage = Usage()
+
+    /// Uma entrada por conta, a padrao primeiro. Com uma conta so -- o caso de
+    /// quem instalou num config dir unico -- e uma lista de um elemento, e o
+    /// painel volta a ser exatamente o de antes.
+    @Published var accounts: [AccountUsage] = []
+
     @Published var apiStatus: APIStatus = .ok
 
     @Published var cost = CostStats()
@@ -710,12 +944,8 @@ final class Store: ObservableObject {
     /// Vive na fila de IO junto com readSessions(), que e quem o consulta.
     private let titles = SessionTitles()
 
-    private let root = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".claude/claude-bar")
-    private let claudeJSON = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".claude.json")
     /// Historico do app nativo. Se ele nao estiver instalado o arquivo nao
-    /// existe, a leitura devolve Usage() vazio e a fonte simplesmente nao entra
+    /// existe, a leitura devolve serie vazia e a fonte simplesmente nao entra
     /// na disputa -- nao ha nada a tratar como erro.
     private let planHistoryJSON = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/Claude/plan-usage-history.json")
@@ -723,12 +953,21 @@ final class Store: ObservableObject {
     private let io = DispatchQueue(label: "local.claudebar.io", qos: .utility)
     private let costQueue = DispatchQueue(label: "local.claudebar.cost", qos: .utility)
 
-    /// Os quatro snapshots ficam separados para poder escolher o mais fresco a
-    /// cada tick, em vez de um sobrescrever o outro.
-    private var fileUsage = Usage()
-    private var cacheUsage = Usage()
-    private var apiUsage = Usage()
-    private var historyUsage = Usage()
+    /// As quatro fontes ficam separadas para poder escolher a mais fresca a cada
+    /// tick, em vez de uma sobrescrever a outra -- e agora ha um conjunto destes
+    /// por conta, indexado pelo id dela. Misturar as fontes de duas contas num
+    /// balde so faria a comparacao por frescor escolher entre numeros de donos
+    /// diferentes, que e o unico jeito de este painel mentir feio.
+    private struct Sources {
+        var api = Usage()
+        var cache = Usage()
+        var history = Usage()
+        var file = Usage()
+    }
+    private var sources: [String: Sources] = [:]
+
+    /// As contas achadas na ultima varredura, na ordem em que aparecem.
+    private var known: [Account] = []
 
     private var nextAPIFetch = Date.distantPast
     private var backoff = K.apiInterval
@@ -760,34 +999,109 @@ final class Store: ObservableObject {
         sessions.map(\.state).min(by: { $0.priority < $1.priority }) ?? .idle
     }
 
-    /// O que vai escrito ao lado do robo, conforme o modo escolhido.
-    var menuText: String {
+    /// A conta que a menu bar representa: a da sessao que manda no icone.
+    ///
+    /// Nao e "a mais recente" nem "a que esta pior" -- e a mesma sessao que o robo
+    /// esta descrevendo, porque `sessions` ja vem ordenada por prioridade de
+    /// estado e, dentro dela, por recencia. Icone e numero falando de sessoes
+    /// diferentes deixaria a barra dizendo que a conta E esta travada enquanto
+    /// mostra a porcentagem da P.
+    ///
+    /// Sem sessao nenhuma sobra a primeira conta, que e sempre a padrao.
+    private var active: AccountUsage? {
+        if let id = sessions.first?.accountID,
+           let hit = accounts.first(where: { $0.id == id }) { return hit }
+        return accounts.first
+    }
+
+    var activeAccount: Account? { active?.account }
+
+    /// O uso que a barra mostra. Campo derivado, e nao mais um @Published: manter
+    /// uma copia do uso da conta ativa era mais um estado para dessincronizar.
+    var usage: Usage { active?.usage ?? Usage() }
+
+    var multiAccount: Bool { accounts.count > 1 }
+
+    /// Recorte de custo com as contas ja nomeadas. O acumulado e indexado por id
+    /// (a letra muda quando o dono da maquina renomeia a conta), entao a traducao
+    /// acontece aqui, uma vez, na hora de montar a tela.
+    func costReport(days: Int) -> CostReport {
+        cost.report(days: days,
+                    accountLabels: Dictionary(accounts.map { ($0.id, $0.account.tag) },
+                                              uniquingKeysWith: { first, _ in first }))
+    }
+
+    /// A conta que a barra mostra quando a preferencia nao e "ambas".
+    ///
+    /// Fixar uma conta que sumiu nao trava a barra em branco: cai para a ativa,
+    /// que e o comportamento padrao.
+    private var barEntry: AccountUsage? {
+        let choice = Settings.shared.barAccount
+        if choice == Settings.barAccountActive || choice == Settings.barAccountBoth { return active }
+        return accounts.first(where: { $0.id == choice }) ?? active
+    }
+
+    /// O que vai escrito ao lado do robo: uma linha, ou duas no modo "ambas".
+    ///
+    /// Lista, e nao String, porque a menu bar do macOS nao quebra linha sozinha
+    /// -- quem empilha e o desenho do icone (ver MenuIcon.image), e ele precisa
+    /// da cor de cada linha separada: duas contas tem severidades diferentes, e
+    /// pintar as duas pela pior esconderia justamente qual delas esta doendo.
+    var menuLines: [BarLine] {
+        guard Settings.shared.barMode != .iconOnly else { return [] }
+        let report = costReport(days: 1)
+
+        // "Ambas" so faz sentido havendo duas: com uma conta o modo se comporta
+        // como qualquer outro, sem virar uma linha solitaria em corpo menor.
+        if Settings.shared.barAccount == Settings.barAccountBoth, multiAccount {
+            return accounts.compactMap { line(for: $0, report: report, showTag: true) }
+        }
+        guard let entry = barEntry else { return [] }
+        return [line(for: entry, report: report, showTag: multiAccount)].compactMap { $0 }
+    }
+
+    /// Uma linha da barra. Nil quando nao sobrou nada para escrever -- limite
+    /// virado sem countdown, por exemplo -- para o robo nao ficar com um espaco
+    /// vazio do lado.
+    private func line(for entry: AccountUsage, report: CostReport, showTag: Bool) -> BarLine? {
+        let usage = entry.usage
+        var text: String
         switch Settings.shared.barMode {
         case .iconOnly:
-            return ""
+            return nil
         case .percent:
-            return percentText
+            text = percentText(usage)
         case .resetTimer:
-            return resetText
+            text = resetText(usage)
         case .percentAndReset:
             // Cada metade ja sabe sumir sozinha -- limite virado apaga a
             // porcentagem, ausencia de resets_at apaga o relogio. O separador
             // so entra quando as duas sobreviveram; montar a string com ele
             // fixo deixaria "| 1h34" ou "54% |" na barra, que le como bug.
-            return [percentText, resetText].filter { !$0.isEmpty }.joined(separator: " | ")
+            text = [percentText(usage), resetText(usage)]
+                .filter { !$0.isEmpty }.joined(separator: " | ")
         case .costToday:
-            return Money.short(cost.report(days: 1).total.cost)
+            // Com mais de uma conta o custo tambem e por conta: a letra na frente
+            // promete que aquele numero e daquele login, e um total somado ali
+            // desmentiria a promessa. Com uma conta so, e o total de sempre.
+            text = Money.short(multiAccount
+                ? (report.byAccount.first(where: { $0.id == entry.id })?.bucket.cost ?? 0)
+                : report.total.cost)
         }
+        guard !text.isEmpty else { return nil }
+        if showTag { text = "\(entry.account.tag) \(text)" }
+        let look = emphasis(for: usage)
+        return BarLine(text: text, color: look.color, badge: look.badge)
     }
 
-    private var percentText: String {
+    private func percentText(_ usage: Usage) -> String {
         guard let five = usage.fiveHour, !five.rolledOver else { return "" }
         return "\(Int(five.pct.rounded()))%"
     }
 
     /// Contagem regressiva ate a janela de 5h virar. Minutos abaixo de uma hora,
     /// senao a barra ficaria mostrando "0h" por 59 minutos.
-    private var resetText: String {
+    private func resetText(_ usage: Usage) -> String {
         guard let five = usage.fiveHour, let at = five.resetsAt else { return "" }
         let secs = at.timeIntervalSinceNow
         guard secs > 0 else { return "0m" }
@@ -799,21 +1113,39 @@ final class Store: ObservableObject {
         return "\(tilde)\(Int(secs / 3600))h\(String(format: "%02d", Int(secs.truncatingRemainder(dividingBy: 3600) / 60)))"
     }
 
-    /// Cor de texto da menu bar. Padrao e `labelColor` -- um numero tranquilo
-    /// tem que se comportar como qualquer outro item da barra. Laranja e
-    /// vermelho ficam reservados para quando o limite esta perto de doer.
+    /// Como aquela linha se apresenta na barra. Padrao e `labelColor` -- um numero
+    /// tranquilo tem que se comportar como qualquer outro item da barra; o realce
+    /// fica reservado para quando o limite esta perto de doer.
     ///
     /// Sessao esperando decisao nao entra aqui: quem sinaliza isso e o robo,
-    /// que fica laranja e pisca. Pintar tambem o numero custaria o unico dado
+    /// que fica laranja e pisca. Realcar tambem o numero custaria o unico dado
     /// que ele carrega -- a porcentagem passaria a mentir sobre a severidade do
-    /// uso justamente quando ela esta em vermelho.
-    var menuTextColor: NSColor {
-        if usage.isStale { return .barStale }
-        guard let five = usage.fiveHour, !five.rolledOver else { return .labelColor }
-        switch five.severity {
-        case .critical: return .barCritical
-        case .warning:  return .systemOrange
-        case .normal:   return .labelColor
+    /// uso justamente quando ela esta alta.
+    ///
+    /// Dado velho nunca ganha realce: um alerta sobre numero congelado alarma
+    /// sobre um estado que talvez nem exista mais.
+    private func emphasis(for usage: Usage) -> (color: NSColor, badge: NSColor?) {
+        if usage.isStale { return (.barStale, nil) }
+        guard let five = usage.fiveHour, !five.rolledOver else { return (.labelColor, nil) }
+
+        switch Settings.shared.barEmphasis {
+        case .plain:
+            return (.labelColor, nil)
+        case .tint:
+            switch five.severity {
+            case .critical: return (.barCritical, nil)
+            case .warning:  return (.systemOrange, nil)
+            case .normal:   return (.labelColor, nil)
+            }
+        case .badge:
+            // Etiqueta so no critico. Duas cores solidas na barra ao mesmo tempo
+            // competiriam entre si, e o laranja de texto ja e legivel -- ele tem
+            // luminancia alta, que e exatamente o que falta ao vermelho.
+            switch five.severity {
+            case .critical: return (.white, .barBadge)
+            case .warning:  return (.systemOrange, nil)
+            case .normal:   return (.labelColor, nil)
+            }
         }
     }
 
@@ -829,10 +1161,14 @@ final class Store: ObservableObject {
     /// mesmo trecho duas vezes.
     private func scanCost() {
         guard !scanning else { return }
+        // Sem conta descoberta ainda nao ha o que varrer: o primeiro reload()
+        // chega em milissegundos e o scan entra no tick seguinte.
+        let roots = known.map { (id: $0.id, url: $0.projectsDir) }
+        guard !roots.isEmpty else { return }
         scanning = true
         costQueue.async { [weak self] in
             guard let self = self else { return }
-            let changed = self.scanner.scan()
+            let changed = self.scanner.scan(roots: roots)
             let snapshot = self.scanner.stats
             DispatchQueue.main.async {
                 self.scanning = false
@@ -844,77 +1180,118 @@ final class Store: ObservableObject {
     // MARK: Disco
 
     func reload() {
+        // Lidos aqui, na main, e levados para a fila de IO como valor.
+        let tags = Settings.shared.accountTags
+        let names = Settings.shared.accountNames
         io.async { [weak self] in
             guard let self = self else { return }
-            let loaded = self.readSessions()
-            let fu = self.readUsageFile()
-            let cached = UsageCache.read(at: self.claudeJSON)
+            // Uma varredura de contas por tick, e dela sai tudo o que e por conta:
+            // qual .claude.json ler, onde estao as sessoes, qual org filtrar no
+            // historico. Listar o $HOME e parsear os .claude.json custa o mesmo
+            // que a leitura unica que havia antes.
+            let scanned = Accounts.scan(tags: tags, names: names)
+            let accounts = scanned.map(\.account)
+            let loaded = self.readSessions(accounts)
+            var files: [String: Usage] = [:]
+            for account in accounts { files[account.id] = self.readUsageFile(account) }
             let history = PlanHistory.read(at: self.planHistoryJSON)
+
             DispatchQueue.main.async {
                 self.sessions = loaded
                 self.pulse.sync(with: self.headline)
-                self.fileUsage = fu
-                self.applyHistory(history)
-                self.applyCache(cached)
+                self.apply(scanned, files: files, history: history)
                 self.publishUsage()
             }
         }
     }
 
-    /// So sobrescreve o snapshot em caso de sucesso. Uma leitura que caiu numa
-    /// escrita pela metade do Claude Code nao pode apagar um numero valido da tela.
-    private func applyCache(_ result: UsageCache.Result) {
-        if case .success(let u) = result { cacheUsage = u }
+    /// Guarda o que cada conta trouxe desta volta.
+    ///
+    /// Regra que vale para as tres fontes de disco: leitura que falhou nao apaga
+    /// numero bom da tela. Aqui o caso comum nem e corrupcao -- e o app nativo nao
+    /// instalado, ou um config dir sem login -- e nesse caso o snapshot fica
+    /// vazio para sempre, sem custo nenhum.
+    private func apply(_ scanned: [(account: Account, snapshot: ClaudeConfig.Snapshot)],
+                       files: [String: Usage],
+                       history: PlanHistory.Series) {
+        known = scanned.map(\.account)
+
+        // Conta que sumiu (config dir apagado, login desfeito) leva junto o que
+        // estava guardado dela: sem isso o painel seguraria um numero orfao, de
+        // uma conta que nao existe mais, para sempre.
+        let ids = Set(known.map(\.id))
+        sources = sources.filter { ids.contains($0.key) }
+
+        for (account, snapshot) in scanned {
+            var s = sources[account.id] ?? Sources()
+            if case .success(let u) = snapshot.usage { s.cache = u }
+            if let u = historyUsage(for: account, in: history), u.at != nil { s.history = u }
+            s.file = files[account.id] ?? Usage()
+            sources[account.id] = s
+        }
     }
 
-    /// Mesma regra do cache: leitura falha nao apaga numero bom da tela. Aqui o
-    /// caso comum nem e corrupcao -- e o app nativo nao estar instalado, e nesse
-    /// caso o snapshot fica vazio para sempre, sem custo nenhum.
-    private func applyHistory(_ u: Usage) {
-        if u.at != nil { historyUsage = u }
+    /// A serie do app nativo que pertence a esta conta.
+    ///
+    /// Sem org conhecida a conta nao herda serie nenhuma. A excecao e a conta
+    /// padrao com um arquivo do formato antigo, sem carimbo de org: ali nao ha
+    /// outra conta com quem confundir. Ficar sem a fonte 2 custa frescor -- pegar
+    /// a serie da conta errada custaria a verdade.
+    private func historyUsage(for account: Account, in series: PlanHistory.Series) -> Usage? {
+        if let org = account.org, let u = series.byOrg[org] { return u }
+        if account.isDefault, series.byOrg.isEmpty { return series.legacy }
+        return nil
     }
 
-    private func readSessions() -> [Session] {
+    private func readSessions(_ accounts: [Account]) -> [Session] {
         var loaded: [Session] = []
-        let dir = root.appendingPathComponent("sessions")
-        let files = (try? FileManager.default.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: nil)) ?? []
+        let fm = FileManager.default
 
-        for file in files where file.pathExtension == "json" {
-            guard let data = try? Data(contentsOf: file),
-                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-            else { continue }
+        for account in accounts {
+            let files = (try? fm.contentsOfDirectory(at: account.sessionsDir,
+                                                     includingPropertiesForKeys: nil)) ?? []
+            for file in files where file.pathExtension == "json" {
+                guard let data = try? Data(contentsOf: file),
+                      let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                else { continue }
 
-            // hook.py grava updated_at; statusline.py grava seen_at. Usar o maior:
-            // uma sessao viva que renderiza a statusline mas nao bate em Stop ha
-            // 6h tem updated_at velho e seria descartada sem isso.
-            let updatedAt = (obj["updated_at"] as? Double) ?? 0
-            let seenAt = (obj["seen_at"] as? Double) ?? 0
-            let stamp = max(updatedAt, seenAt)
-            guard stamp > 0 else { continue }
-            let updated = Date(timeIntervalSince1970: stamp)
-            guard Date().timeIntervalSince(updated) < K.staleAfter else { continue }
+                // hook.py grava updated_at; statusline.py grava seen_at. Usar o maior:
+                // uma sessao viva que renderiza a statusline mas nao bate em Stop ha
+                // 6h tem updated_at velho e seria descartada sem isso.
+                let updatedAt = (obj["updated_at"] as? Double) ?? 0
+                let seenAt = (obj["seen_at"] as? Double) ?? 0
+                let stamp = max(updatedAt, seenAt)
+                guard stamp > 0 else { continue }
+                let updated = Date(timeIntervalSince1970: stamp)
+                guard Date().timeIntervalSince(updated) < K.staleAfter else { continue }
 
-            let id = obj["session_id"] as? String ?? file.lastPathComponent
-            loaded.append(Session(
-                id: id,
-                project: obj["project"] as? String ?? "—",
-                state: SessionState(rawValue: obj["state"] as? String ?? "idle") ?? .idle,
-                label: obj["label"] as? String ?? "",
-                model: obj["model"] as? String ?? "",
-                contextPct: obj["context_pct"] as? Int,
-                updatedAt: updated,
-                title: titles.title(for: id),
-                cwd: obj["cwd"] as? String ?? ""
-            ))
+                let id = obj["session_id"] as? String ?? file.lastPathComponent
+                loaded.append(Session(
+                    id: id,
+                    project: obj["project"] as? String ?? "—",
+                    state: SessionState(rawValue: obj["state"] as? String ?? "idle") ?? .idle,
+                    label: obj["label"] as? String ?? "",
+                    model: obj["model"] as? String ?? "",
+                    contextPct: obj["context_pct"] as? Int,
+                    updatedAt: updated,
+                    // O transcript e procurado so no projects/ desta conta: e
+                    // onde ele esta, e limita a busca a uma arvore em vez de
+                    // todas.
+                    title: titles.title(for: id, in: account.projectsDir),
+                    cwd: obj["cwd"] as? String ?? "",
+                    accountID: account.id,
+                    accountTag: account.tag,
+                    configDir: account.configDir
+                ))
+            }
         }
         loaded.sort { ($0.state.priority, $1.updatedAt) < ($1.state.priority, $0.updatedAt) }
         return loaded
     }
 
-    private func readUsageFile() -> Usage {
+    private func readUsageFile(_ account: Account) -> Usage {
         var u = Usage()
-        guard let data = try? Data(contentsOf: root.appendingPathComponent("usage.json")),
+        guard let data = try? Data(contentsOf: account.usageFile),
               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else { return u }
 
@@ -933,19 +1310,27 @@ final class Store: ObservableObject {
         return u
     }
 
-    /// Escolhe a fonte mais fresca das quatro. Comparar por carimbo, e nao por
-    /// prioridade fixa, e o que faz o painel nunca andar para tras: no primeiro
-    /// segundo o cache do disco ganha, e assim que a API responde ela assume.
+    /// Resolve o uso de cada conta e publica a lista que o painel desenha.
+    private func publishUsage() {
+        accounts = known.map {
+            AccountUsage(account: $0, usage: Store.merge(sources[$0.id] ?? Sources()))
+        }
+    }
+
+    /// Escolhe a fonte mais fresca das quatro **de uma conta**. Comparar por
+    /// carimbo, e nao por prioridade fixa, e o que faz o painel nunca andar para
+    /// tras: no primeiro segundo o cache do disco ganha, e assim que a API
+    /// responde ela assume.
     ///
     /// Depois vem o remendo: a fonte que costuma vencer por frescor -- o
     /// historico do app nativo -- so tem porcentagem. Publicar ela crua zeraria o
     /// countdown de reset e apagaria os creditos extra a cada tick. Entao o
     /// vencedor manda no *numero de uso*, e os campos que ele nao sabe carregar
     /// sao herdados do snapshot mais recente que os tenha.
-    private func publishUsage() {
-        let candidates = [apiUsage, cacheUsage, historyUsage, fileUsage].filter { $0.at != nil }
+    private static func merge(_ s: Sources) -> Usage {
+        let candidates = [s.api, s.cache, s.history, s.file].filter { $0.at != nil }
         guard var best = candidates.max(by: { ($0.at ?? .distantPast) < ($1.at ?? .distantPast) })
-        else { usage = Usage(); return }
+        else { return Usage() }
 
         let byFreshness = candidates.sorted {
             ($0.at ?? .distantPast) > ($1.at ?? .distantPast)
@@ -994,23 +1379,37 @@ final class Store: ObservableObject {
             best.extra = byFreshness.first(where: { $0.source.carriesExtra })?.extra
         }
 
-        usage = best
+        return best
     }
 
     // MARK: API
+
+    /// A conta que a API cobre -- a padrao, e so ela.
+    ///
+    /// O token sai do item `Claude Code-credentials` do Keychain, que e o da
+    /// instalacao padrao; um config dir proprio guarda a credencial dele em outro
+    /// item, cujo nome este projeto ainda nao confirmou. Enquanto nao confirmar,
+    /// a resposta da API pertence a conta padrao e a nenhuma outra: atribuir o
+    /// numero a conta errada seria pior do que a conta extra ficar sem a fonte 1.
+    ///
+    /// Na pratica a conta extra nao sente falta: ela e a que vive no terminal,
+    /// onde a statusline roda a cada prompt com `rate_limits` vindo do proprio
+    /// Claude Code -- mais fresco que qualquer poleio nosso.
+    private var apiAccount: Account? { known.first(where: { $0.isDefault }) }
 
     /// `force` e o clique: abrir o painel ou apertar Atualizar passa por cima do
     /// agendamento e da economia abaixo, mas nunca por cima de um 429 (quem
     /// chama e que decide isso) nem de um fetch ja em voo.
     private func maybeFetchAPI(force: Bool = false) {
         guard !fetching, force || Date() >= nextAPIFetch else { return }
+        guard let target = apiAccount else { return }
 
         // Economia que muda o desenho do app: enquanto o historico do app nativo
         // estiver fresco, ele ja cobre o painel de graca e a requisicao periodica
         // nao melhoraria numero nenhum -- so aumentaria a chance de 429. Fechou o
         // app nativo (ou nunca foi instalado), a serie envelhece e o poller volta
         // sozinho no ciclo seguinte.
-        if !force, let at = historyUsage.at,
+        if !force, let at = sources[target.id]?.history.at,
            Date().timeIntervalSince(at) < K.passiveFresh {
             scheduleNextFetch(K.apiInterval)
             return
@@ -1037,19 +1436,25 @@ final class Store: ObservableObject {
                     self.scheduleNextFetch(K.authRetry)
                     return
                 }
-                self.performFetch(token.bearer)
+                self.performFetch(token.bearer, for: target.id)
             }
         }
     }
 
-    private func performFetch(_ token: String) {
+    private func performFetch(_ token: String, for accountID: String) {
         UsageAPI.fetch(token: token) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.fetching = false
                 switch result {
                 case .success(let u):
-                    self.apiUsage = u
+                    // Se a conta sumiu enquanto a requisicao estava no ar, o
+                    // resultado morre aqui: ele nao tem dono.
+                    guard self.sources[accountID] != nil || self.known.contains(where: { $0.id == accountID })
+                    else { return }
+                    var s = self.sources[accountID] ?? Sources()
+                    s.api = u
+                    self.sources[accountID] = s
                     self.apiStatus = .ok
                     self.backoff = K.apiInterval
                     self.scheduleNextFetch(K.apiInterval)
@@ -1208,6 +1613,12 @@ struct CostStats {
     var days: [String: Bucket] = [:]
     var projects: [String: [String: Bucket]] = [:]
     var models: [String: [String: Bucket]] = [:]
+    /// Mesma indexacao por dia das outras duas, com o **id** da conta na chave --
+    /// nao a letra, que o dono da maquina pode reescrever a qualquer momento; o
+    /// acumulado ficaria orfao da chave antiga. Sem esta dimensao o mesmo projeto
+    /// aberto nas duas contas -- o caso comum de quem tem duas -- somaria num
+    /// numero unico sem dono.
+    var accounts: [String: [String: Bucket]] = [:]
 
     /// Modelos sem preco na tabela. O painel avisa em vez de mostrar um total
     /// que finge estar completo.
@@ -1220,17 +1631,21 @@ struct CostReport {
     var total = Bucket()
     var byProject: [(name: String, bucket: Bucket)] = []
     var byModel: [(name: String, bucket: Bucket)] = []
+    var byAccount: [(id: String, name: String, bucket: Bucket)] = []
     var daily: [Double] = []     // custo por dia, do mais antigo ao mais novo
     var partial = false
 }
 
 extension CostStats {
-    /// `days` = 1 devolve so hoje.
-    func report(days windowDays: Int) -> CostReport {
+    /// `days` = 1 devolve so hoje. `accountLabels` traduz id -> letra na hora de
+    /// montar o recorte; id sem traducao nao entra, porque uma conta que sumiu
+    /// nao tem como ser nomeada na tela.
+    func report(days windowDays: Int, accountLabels: [String: String] = [:]) -> CostReport {
         let keys = CostStats.dayKeys(back: windowDays)
         var r = CostReport()
         var projects: [String: Bucket] = [:]
         var models: [String: Bucket] = [:]
+        var accounts: [String: Bucket] = [:]
 
         for key in keys {
             let day = days[key] ?? Bucket()
@@ -1238,12 +1653,19 @@ extension CostStats {
             r.daily.append(day.cost)
             for (name, b) in self.projects[key] ?? [:] { projects[name, default: Bucket()] += b }
             for (name, b) in self.models[key] ?? [:] { models[name, default: Bucket()] += b }
+            for (name, b) in self.accounts[key] ?? [:] { accounts[name, default: Bucket()] += b }
         }
 
         r.byProject = projects.map { (name: $0.key, bucket: $0.value) }
             .sorted { $0.bucket.cost > $1.bucket.cost }
         r.byModel = models.map { (name: $0.key, bucket: $0.value) }
             .sorted { $0.bucket.cost > $1.bucket.cost }
+        // Por letra, nao por custo: a ordem das contas e estavel no painel e uma
+        // lista de duas linhas que troca de ordem sozinha se le como dado mudando
+        // quando o que mudou foi so a soma.
+        r.byAccount = accounts.compactMap { id, bucket in
+            accountLabels[id].map { (id: id, name: $0, bucket: bucket) }
+        }.sorted { $0.name < $1.name }
         r.partial = !unpriced.isEmpty && models.keys.contains { unpriced.contains($0) }
         return r
     }
@@ -1274,14 +1696,14 @@ extension CostStats {
 /// 300MB reparseados a cada tick.
 private enum Transcripts {
 
-    static let root = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".claude/projects")
-
     struct Entry {
         let key: String       // id da mensagem + requestId, para deduplicar
         let day: String
         let project: String
         let model: String
+        /// Id da conta dona do transcript. Sai do config dir de onde o arquivo foi
+        /// lido -- o proprio registro nao diz de quem e.
+        let account: String
         let bucket: Bucket
     }
 
@@ -1305,7 +1727,7 @@ private enum Transcripts {
     /// E com `read(2)` em vez de `FileHandle.read(upToCount:)`. Nao e purismo --
     /// medido nos mesmos 317MB de transcript: FileHandle chegou a 329MB de pico
     /// e 1.81s; o POSIX fez 8.7MB e 0.11s. FileHandle segura tudo o que leu.
-    static func read(_ url: URL, from offset: UInt64) -> Chunk? {
+    static func read(_ url: URL, from offset: UInt64, account: String) -> Chunk? {
         let descriptor = Darwin.open(url.path, O_RDONLY)
         guard descriptor >= 0 else { return nil }
         defer { Darwin.close(descriptor) }
@@ -1333,7 +1755,7 @@ private enum Transcripts {
                 while let newline = buffer[start...].firstIndex(of: 0x0A) {
                     let line = buffer[start..<newline]
                     chunk.offset += UInt64(line.count + 1)
-                    if let entry = parse(line) { chunk.entries.append(entry) }
+                    if let entry = parse(line, account: account) { chunk.entries.append(entry) }
                     start = buffer.index(after: newline)
                 }
                 carry = Data(buffer[start...])
@@ -1348,7 +1770,7 @@ private enum Transcripts {
         return chunk
     }
 
-    private static func parse(_ line: Data) -> Entry? {
+    private static func parse(_ line: Data, account: String) -> Entry? {
         // Filtro por bytes antes do JSON: a esmagadora maioria das linhas e
         // input do usuario e nao tem usage nenhum.
         guard line.range(of: usageMarker) != nil,
@@ -1388,7 +1810,7 @@ private enum Transcripts {
         let request = obj["requestId"] as? String ?? ""
 
         return Entry(key: "\(id)|\(request)", day: CostStats.dayKey(date),
-                     project: project, model: model, bucket: b)
+                     project: project, model: model, account: account, bucket: b)
     }
 }
 
@@ -1398,7 +1820,10 @@ extension Transcripts {
     /// Procurar pelo nome em vez de reconstruir o caminho a partir do `cwd` e de
     /// proposito: a codificacao da pasta e destrutiva ("LP F1 Bolão" vira
     /// "-Users-...-LP-F1-Bol-o") e nao da para desfazer. O UUID e unico.
-    static func transcript(sessionID: String) -> URL? {
+    ///
+    /// A busca fica no `projects/` da conta da sessao: e onde o arquivo esta, e
+    /// varrer as arvores das outras contas seria procurar onde nao pode haver.
+    static func transcript(sessionID: String, in root: URL) -> URL? {
         let fm = FileManager.default
         guard let dirs = try? fm.contentsOfDirectory(at: root,
                                                      includingPropertiesForKeys: nil) else { return nil }
@@ -1431,8 +1856,8 @@ extension Transcripts {
     ///     rejeição de produtos...". O do fim e o que a aba mostra.
     ///  2. `ai-title` do inicio, se a cauda nao tiver nenhum.
     ///  3. Primeira mensagem do usuario, para os transcripts sem titulo nenhum.
-    static func conversationTitle(sessionID: String) -> String? {
-        guard let url = transcript(sessionID: sessionID) else { return nil }
+    static func conversationTitle(sessionID: String, in root: URL) -> String? {
+        guard let url = transcript(sessionID: sessionID, in: root) else { return nil }
         if let recent = tailAITitle(url) { return recent }
         return headTitle(url)
     }
@@ -1545,8 +1970,8 @@ extension Transcripts {
     ///
     /// Varredura de cabeca, com o mesmo teto do titulo: o carimbo esta na
     /// primeira mensagem, e nao muda no resto da conversa.
-    static func entrypoint(sessionID: String) -> String? {
-        guard let url = transcript(sessionID: sessionID) else { return nil }
+    static func entrypoint(sessionID: String, in root: URL) -> String? {
+        guard let url = transcript(sessionID: sessionID, in: root) else { return nil }
         let descriptor = Darwin.open(url.path, O_RDONLY)
         guard descriptor >= 0 else { return nil }
         defer { Darwin.close(descriptor) }
@@ -1607,12 +2032,12 @@ final class SessionTitles {
     /// transcript em disco, e sem retentar ela ficaria pela pasta para sempre.
     private let retry: TimeInterval = 20
 
-    func title(for sessionID: String) -> String? {
+    func title(for sessionID: String, in root: URL) -> String? {
         if let cached = cache[sessionID] {
             let window = cached.title == nil ? retry : refresh
             if Date().timeIntervalSince(cached.checkedAt) < window { return cached.title }
         }
-        let title = Transcripts.conversationTitle(sessionID: sessionID)
+        let title = Transcripts.conversationTitle(sessionID: sessionID, in: root)
             .map { SessionTitles.condense($0) }
         cache[sessionID] = Cached(title: title, checkedAt: Date())
         return title
@@ -1662,7 +2087,9 @@ enum Reveal {
             // De que lado procurar. Sem isso, uma sessao do app nativo casaria
             // pelo cwd com o processo do editor que tem a mesma pasta aberta --
             // e o clique focaria a janela errada, de outra sessao.
-            let desktop = Transcripts.entrypoint(sessionID: session.id) == desktopEntrypoint
+            let desktop = Transcripts.entrypoint(sessionID: session.id,
+                                                 in: session.configDir.appendingPathComponent("projects"))
+                == desktopEntrypoint
             let process = hostProcess(for: session, desktop: desktop, table)
             // O app sai do processo *daquela* sessao. Com VS Code e Cursor
             // abertos ao mesmo tempo, o primeiro da lista seria o de outra
@@ -1781,7 +2208,7 @@ enum Reveal {
                                    _ process: Proc?,
                                    _ table: Table) -> URL? {
         if let host = process?.host, let port = listeningPort(of: host),
-           let folders = folders(inLock: lock(port: port)), !folders.isEmpty {
+           let folders = folders(inLock: lock(port: port, in: session.configDir)), !folders.isEmpty {
             // Aqui a janela ja esta certa: qualquer raiz dela foca ela. A que
             // contem o cwd e a preferida; sem nenhuma (multi-root), a primeira,
             // que e a raiz pela qual o editor nomeia a janela.
@@ -1794,7 +2221,8 @@ enum Reveal {
         // raiz de janela conhecida, nunca um caminho solto. Sem conter o cwd,
         // porem, nao ha o que deduzir: aqui a primeira raiz seria a janela de
         // outro projeto, entao nil e a resposta.
-        guard let root = containing(session.cwd, in: openWindowRoots()) else { return nil }
+        guard let root = containing(session.cwd, in: openWindowRoots(in: session.configDir))
+        else { return nil }
         return URL(fileURLWithPath: root)
     }
 
@@ -1813,10 +2241,10 @@ enum Reveal {
         return best?.folder
     }
 
-    /// Raizes de todas as janelas com Claude Code, lidas dos locks em disco.
-    private static func openWindowRoots() -> [String] {
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/ide")
+    /// Raizes de todas as janelas com Claude Code **daquela conta**, lidas dos
+    /// locks em disco.
+    private static func openWindowRoots(in configDir: URL) -> [String] {
+        let dir = configDir.appendingPathComponent("ide")
         let locks = (try? FileManager.default.contentsOfDirectory(
             at: dir, includingPropertiesForKeys: nil)) ?? []
         return locks.filter { $0.pathExtension == "lock" }
@@ -1874,9 +2302,12 @@ enum Reveal {
         return nil
     }
 
-    private static func lock(port: String) -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/ide/\(port).lock")
+    /// `<config dir>/ide/<porta>.lock` -- o da conta da sessao, nao o da padrao.
+    /// Cada conta do Claude Code escreve os locks dela dentro do proprio config
+    /// dir; procurar no lugar errado nao acharia nada, ou acharia a janela de uma
+    /// sessao de outra conta.
+    private static func lock(port: String, in configDir: URL) -> URL {
+        configDir.appendingPathComponent("ide/\(port).lock")
     }
 
     /// Le `~/.claude/ide/<porta>.lock`, que a integracao do Claude Code escreve
@@ -1915,36 +2346,45 @@ private final class CostScanner {
     /// inteiro da maquina.
     private let horizon: TimeInterval = 60 * 60 * 24 * 35
 
-    /// `true` se algo mudou -- so entao vale republicar para a UI.
+    /// Varre o `projects/` de cada conta. `true` se algo mudou -- so entao vale
+    /// republicar para a UI.
+    ///
+    /// Os cursores sao indexados por caminho absoluto, entao duas contas nunca
+    /// disputam o mesmo: incluir uma conta nova e aditivo, e a leitura
+    /// incremental das que ja estavam continua de onde parou.
     @discardableResult
-    func scan() -> Bool {
+    func scan(roots: [(id: String, url: URL)]) -> Bool {
         let fm = FileManager.default
-        guard let walker = fm.enumerator(at: Transcripts.root,
-                                         includingPropertiesForKeys: [.contentModificationDateKey,
-                                                                      .fileSizeKey],
-                                         options: [.skipsHiddenFiles]) else { return false }
         var changed = false
         let cutoff = Date().addingTimeInterval(-horizon)
 
-        for case let url as URL in walker where url.pathExtension == "jsonl" {
-            let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
-            guard let modified = values?.contentModificationDate, modified > cutoff else { continue }
-            let size = UInt64(values?.fileSize ?? 0)
-            let path = url.path
-            var offset = cursors[path] ?? 0
+        for root in roots {
+            guard let walker = fm.enumerator(at: root.url,
+                                             includingPropertiesForKeys: [.contentModificationDateKey,
+                                                                          .fileSizeKey],
+                                             options: [.skipsHiddenFiles]) else { continue }
 
-            // Arquivo encolheu: foi reescrito, nao apendado. Recomeca do zero.
-            if size < offset { offset = 0 }
-            guard size > offset else { continue }
+            for case let url as URL in walker where url.pathExtension == "jsonl" {
+                let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+                guard let modified = values?.contentModificationDate, modified > cutoff else { continue }
+                let size = UInt64(values?.fileSize ?? 0)
+                let path = url.path
+                var offset = cursors[path] ?? 0
 
-            guard let chunk = Transcripts.read(url, from: offset) else { continue }
-            cursors[path] = chunk.offset
-            for entry in chunk.entries where seen.insert(entry.key).inserted {
-                stats.days[entry.day, default: Bucket()] += entry.bucket
-                stats.projects[entry.day, default: [:]][entry.project, default: Bucket()] += entry.bucket
-                stats.models[entry.day, default: [:]][entry.model, default: Bucket()] += entry.bucket
-                if Pricing.base(for: entry.model) == nil { stats.unpriced.insert(entry.model) }
-                changed = true
+                // Arquivo encolheu: foi reescrito, nao apendado. Recomeca do zero.
+                if size < offset { offset = 0 }
+                guard size > offset else { continue }
+
+                guard let chunk = Transcripts.read(url, from: offset, account: root.id) else { continue }
+                cursors[path] = chunk.offset
+                for entry in chunk.entries where seen.insert(entry.key).inserted {
+                    stats.days[entry.day, default: Bucket()] += entry.bucket
+                    stats.projects[entry.day, default: [:]][entry.project, default: Bucket()] += entry.bucket
+                    stats.models[entry.day, default: [:]][entry.model, default: Bucket()] += entry.bucket
+                    stats.accounts[entry.day, default: [:]][entry.account, default: Bucket()] += entry.bucket
+                    if Pricing.base(for: entry.model) == nil { stats.unpriced.insert(entry.model) }
+                    changed = true
+                }
             }
         }
 
@@ -1975,6 +2415,26 @@ enum BarMode: String, CaseIterable, Identifiable {
     }
 }
 
+/// Como a menu bar sinaliza limite alto.
+///
+/// O problema e que o fundo ali e o wallpaper, nao uma superficie controlada:
+/// texto colorido depende de sorte com o que estiver atras. `.badge` resolve
+/// levando o proprio fundo -- e o unico que garante contraste sobre qualquer
+/// papel de parede, e por isso e o padrao.
+enum BarEmphasis: String, CaseIterable, Identifiable {
+    case badge, tint, plain
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .badge: return "Destaque: etiqueta"
+        case .tint:  return "Destaque: cor no número"
+        case .plain: return "Destaque: nenhum"
+        }
+    }
+}
+
 /// A unica coisa que este app escreve em disco, e nao e em `~/.claude`:
 /// UserDefaults, em ~/Library/Preferences/local.claudebar.plist. Preferencia de
 /// exibicao precisa sobreviver ao relaunch; nada mais e persistido, e nenhuma
@@ -1985,6 +2445,42 @@ final class Settings: ObservableObject {
 
     @Published var barMode: BarMode {
         didSet { store.set(barMode.rawValue, forKey: "barMode") }
+    }
+    /// Qual conta a menu bar mostra: a da sessao ativa, as duas empilhadas, ou
+    /// uma fixa. Guardado como String porque o valor de "fixa" e o id de uma
+    /// conta -- que so existe em tempo de execucao e nao cabe num enum.
+    @Published var barAccount: String {
+        didSet { store.set(barAccount, forKey: "barAccount") }
+    }
+
+    /// Como o limite alto aparece na menu bar. Ver BarEmphasis.
+    @Published var barEmphasis: BarEmphasis {
+        didSet { store.set(barEmphasis.rawValue, forKey: "barEmphasis") }
+    }
+
+    /// Letra e nome que o dono da maquina deu a cada conta, por id.
+    ///
+    /// "P" e "E" sao so o padrao posicional -- servem para quem tem uma pessoal e
+    /// uma da empresa e nao servem para mais ninguem. Quem tem duas contas de
+    /// cliente, ou tres, precisa escrever a propria legenda.
+    @Published var accountTags: [String: String] {
+        didSet { store.set(accountTags, forKey: "accountTags") }
+    }
+    @Published var accountNames: [String: String] {
+        didSet { store.set(accountNames, forKey: "accountNames") }
+    }
+
+    /// Limite de tamanho da letra. Nao e capricho: cada caractere aqui empurra
+    /// todos os vizinhos da menu bar, e o campo aceita texto livre.
+    static let maxTagLength = 3
+
+    func setLabel(tag: String, name: String, for id: String) {
+        // Vazio apaga a personalizacao em vez de gravar string vazia -- e assim
+        // que se volta ao padrao sem precisar de um botao "restaurar".
+        let tag = String(tag.trimmingCharacters(in: .whitespacesAndNewlines).prefix(Settings.maxTagLength))
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if tag.isEmpty { accountTags.removeValue(forKey: id) } else { accountTags[id] = tag }
+        if name.isEmpty { accountNames.removeValue(forKey: id) } else { accountNames[id] = name }
     }
     @Published var costWindow: Int {
         didSet { store.set(costWindow, forKey: "costWindow") }
@@ -1999,6 +2495,12 @@ final class Settings: ObservableObject {
         didSet { store.set(animateIcon, forKey: "animateIcon") }
     }
 
+    /// Segue a conta da sessao que o robo esta descrevendo. E o padrao: com duas
+    /// contas, a que voce esta usando agora e quase sempre a que voce quer ver.
+    static let barAccountActive = "active"
+    /// As duas contas, uma sobre a outra, em corpo menor.
+    static let barAccountBoth = "both"
+
     static let minListHeight: Double = 70
     static let maxListHeight: Double = 420
 
@@ -2007,6 +2509,10 @@ final class Settings: ObservableObject {
         // salvo -- o antigo padrao -- cai em `.percent`, que e o que aquele
         // modo virou quando a contagem saiu da barra.
         barMode = BarMode(rawValue: store.string(forKey: "barMode") ?? "") ?? .percent
+        barAccount = store.string(forKey: "barAccount") ?? Settings.barAccountActive
+        barEmphasis = BarEmphasis(rawValue: store.string(forKey: "barEmphasis") ?? "") ?? .badge
+        accountTags = store.dictionary(forKey: "accountTags") as? [String: String] ?? [:]
+        accountNames = store.dictionary(forKey: "accountNames") as? [String: String] ?? [:]
         costWindow = store.object(forKey: "costWindow") as? Int ?? 7
         let saved = store.object(forKey: "listHeight") as? Double ?? 130
         listHeight = min(max(saved, Settings.minListHeight), Settings.maxListHeight)
@@ -2089,26 +2595,61 @@ enum MenuIcon {
     static let height: CGFloat = 18
     private static let robotWidth: CGFloat = 14
     private static let gap: CGFloat = 4.5
+    /// Respiro entre o texto e a borda da etiqueta.
+    private static let badgePadding: CGFloat = 3.5
 
     /// Digitos monoespacados para a porcentagem nao dancar de largura a cada
     /// ponto percentual -- o item inteiro tremeria na menu bar.
     private static let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
 
-    static func image(state: SessionState, text: String,
-                      textColor: NSColor, phase: Double) -> NSImage {
-        let label: NSAttributedString? = text.isEmpty ? nil : NSAttributedString(
-            string: text, attributes: [.font: font, .foregroundColor: textColor])
-        let textWidth = label.map { ceil($0.size().width) } ?? 0
-        let width = robotWidth + (textWidth > 0 ? gap + textWidth : 0)
+    /// Corpo das duas linhas do modo "ambas". 12pt nao cabe duas vezes em 18pt de
+    /// altura -- duas linhas dessas pedem 24pt e seriam recortadas pela barra.
+    /// 8.5pt com peso semibold cabe com folga de 1pt e continua legivel: o peso
+    /// compensa o tamanho, que e o mesmo truque dos indicadores nativos que
+    /// empilham duas informacoes (bateria com porcentagem, por exemplo).
+    private static let stackedFont = NSFont.monospacedDigitSystemFont(ofSize: 8.5, weight: .semibold)
+
+    static func image(state: SessionState, lines: [BarLine], phase: Double) -> NSImage {
+        let face = lines.count > 1 ? stackedFont : font
+        let labels = lines.map {
+            NSAttributedString(string: $0.text,
+                               attributes: [.font: face, .foregroundColor: $0.color])
+        }
+        // A etiqueta cresce para os lados; a largura do item tem que contar com
+        // isso, ou o fundo sairia cortado na borda do NSImage.
+        let hasBadge = lines.contains { $0.badge != nil }
+        let textWidth = labels.map { ceil($0.size().width) }.max() ?? 0
+        let boxWidth = textWidth > 0 ? textWidth + (hasBadge ? badgePadding * 2 : 0) : 0
+        let width = robotWidth + (boxWidth > 0 ? gap + boxWidth : 0)
 
         let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { _ in
             drawRobot(state: state, phase: phase)
-            if let label = label {
-                // Centralizado pela altura de caixa-alta, nao pela altura de
-                // linha: e o que faz o "54%" bater com o texto dos vizinhos, ja
-                // que ascender e descender carregam folga que nao aparece.
-                let baseline = (height - font.capHeight) / 2
-                label.draw(at: NSPoint(x: robotWidth + gap, y: baseline + font.descender))
+            // A altura e dividida em tantas faixas quantas forem as linhas, e
+            // cada uma e centralizada dentro da sua faixa -- pela altura de
+            // caixa-alta, nao pela altura de linha: e o que faz o "54%" bater com
+            // o texto dos vizinhos da barra, ja que ascender e descender carregam
+            // folga que nao aparece.
+            let band = height / CGFloat(max(labels.count, 1))
+            for (index, label) in labels.enumerated() {
+                // De cima para baixo: a primeira conta e a primeira linha.
+                let bottom = height - band * CGFloat(index + 1)
+                let baseline = bottom + (band - face.capHeight) / 2
+                var x = robotWidth + gap
+                if hasBadge { x += badgePadding }
+
+                if let badge = lines[index].badge {
+                    // Altura da etiqueta: a caixa-alta mais um respiro, sem nunca
+                    // encostar na borda da faixa -- duas etiquetas empilhadas
+                    // precisam de um fio entre elas para nao lerem como um bloco
+                    // so.
+                    let boxH = min(band - 1, face.capHeight + 5)
+                    let boxW = ceil(label.size().width) + badgePadding * 2
+                    let box = NSRect(x: x - badgePadding, y: bottom + (band - boxH) / 2,
+                                     width: boxW, height: boxH)
+                    badge.setFill()
+                    NSBezierPath(roundedRect: box, xRadius: 2.5, yRadius: 2.5).fill()
+                }
+                label.draw(at: NSPoint(x: x, y: baseline + face.descender))
             }
             return true
         }
@@ -2201,6 +2742,136 @@ enum MenuIcon {
 }
 
 // MARK: - UI
+
+extension Usage {
+    /// Origem + idade do dado. Um numero congelado nunca deve se passar por vivo
+    /// -- e o que separa um painel confiavel de um que engana.
+    var sourceNote: String {
+        guard let at = at else { return source.label }
+        let secs = Int(Date().timeIntervalSince(at))
+        let age = secs < 60 ? "agora" : (secs < 3600 ? "há \(secs / 60)min" : "há \(secs / 3600)h")
+        return "\(source.label) · \(age)"
+    }
+}
+
+/// A letra da conta ("P", "E"). Vai num quadradinho com contorno, e nao como
+/// texto solto: na linha da sessao ela divide espaco com modelo e contexto, e
+/// sem moldura o "E" leria como mais um pedaco daquele texto.
+struct AccountBadge: View {
+    let tag: String
+
+    var body: some View {
+        Text(tag)
+            .font(.caption2.weight(.bold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .overlay(
+                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    .strokeBorder(Color.secondary.opacity(0.45))
+            )
+    }
+}
+
+/// Os limites de uma conta.
+struct UsageCard: View {
+    let entry: AccountUsage
+    /// Cabecalho so aparece quando ha mais de uma conta. Com uma so, este cartao
+    /// e o painel inteiro: repetir ali o email de quem esta logado seria mobilia.
+    let showHeader: Bool
+    /// Recado da API. So a conta padrao tem -- ver Store.apiAccount.
+    let note: String?
+    /// Chamado depois de renomear, para a barra e os cartoes pegarem o nome novo
+    /// na hora em vez de no proximo tick de 5s.
+    let onRename: () -> Void
+
+    @ObservedObject private var settings = Settings.shared
+    @State private var editing = false
+    @State private var draftTag = ""
+    @State private var draftName = ""
+    @State private var hovering = false
+
+    var body: some View {
+        Card {
+            if showHeader {
+                if editing { editor } else { header }
+            }
+            LimitBar(title: "Sessão de 5h", limit: entry.usage.fiveHour,
+                     dimmed: entry.usage.isStale)
+            LimitBar(title: "Semana (7d)", limit: entry.usage.sevenDay,
+                     dimmed: entry.usage.isStale)
+            if let extra = entry.usage.extra { ExtraUsageRow(extra: extra) }
+            if let note = note {
+                Text(note).font(.caption2).foregroundStyle(.secondary)
+            }
+            if entry.usage.source == .none {
+                Text("Sem dados de limite ainda — abra uma sessão do Claude Code.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 6) {
+            AccountBadge(tag: entry.account.tag)
+            Text(entry.account.name)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            // O lapis so aparece no hover: ele e uma acao rara, e um icone fixo
+            // em cada cartao competiria com o dado, que e o que se vem ver.
+            if hovering {
+                Image(systemName: "pencil")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            Text(entry.usage.sourceNote)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .onTapGesture {
+            draftTag = entry.account.tag
+            draftName = entry.account.name
+            editing = true
+        }
+        .help("Clique para dar um nome e uma letra a esta conta")
+    }
+
+    private var editor: some View {
+        HStack(spacing: 6) {
+            TextField("", text: $draftTag)
+                .frame(width: 34)
+                .multilineTextAlignment(.center)
+                .onChange(of: draftTag) { value in
+                    // Cortado na digitacao, e nao so ao salvar: o campo tem 34pt e
+                    // texto que nao cabe rolando dentro dele parece bug.
+                    let clean = value.replacingOccurrences(of: "\n", with: "")
+                    if clean.count > Settings.maxTagLength {
+                        draftTag = String(clean.prefix(Settings.maxTagLength))
+                    } else if clean != value {
+                        draftTag = clean
+                    }
+                }
+            TextField("nome da conta", text: $draftName)
+            Button("OK") { commit() }
+                .keyboardShortcut(.defaultAction)
+        }
+        .font(.caption)
+        .textFieldStyle(.roundedBorder)
+        .onExitCommand { editing = false }
+    }
+
+    /// Grava e volta ao cabecalho. Campo vazio nao vira nome vazio: apaga a
+    /// personalizacao e a conta volta ao padrao (letra posicional, e-mail).
+    private func commit() {
+        settings.setLabel(tag: draftTag, name: draftName, for: entry.id)
+        editing = false
+        onRename()
+    }
+}
 
 struct LimitBar: View {
     let title: String
@@ -2390,7 +3061,7 @@ struct CostCard: View {
     @ObservedObject private var settings = Settings.shared
 
     var body: some View {
-        let report = store.cost.report(days: settings.costWindow)
+        let report = store.costReport(days: settings.costWindow)
 
         Card {
             HStack {
@@ -2418,6 +3089,13 @@ struct CostCard: View {
 
             if report.daily.count > 1 { Sparkline(values: report.daily) }
 
+            // Antes de projeto e modelo: com duas contas, "de quem foi este
+            // gasto" e a primeira pergunta, e o mesmo projeto pode aparecer nas
+            // duas.
+            if report.byAccount.count > 1 {
+                breakdown("Por conta", report.byAccount.map { (name: $0.name, bucket: $0.bucket) },
+                          total: report.total.cost)
+            }
             breakdown("Por projeto", report.byProject, total: report.total.cost)
             breakdown("Por modelo", report.byModel, total: report.total.cost)
 
@@ -2458,6 +3136,8 @@ struct CostCard: View {
 
 struct SessionRow: View {
     let session: Session
+    /// Ligado so quando ha mais de uma conta -- ver Store.multiAccount.
+    let showAccount: Bool
     @State private var hovering = false
 
     private var canOpen: Bool { !session.cwd.isEmpty }
@@ -2477,6 +3157,7 @@ struct SessionRow: View {
                         .fixedSize(horizontal: false, vertical: true)
 
                     HStack(spacing: 6) {
+                        if showAccount { AccountBadge(tag: session.accountTag) }
                         // A pasta so aparece quando ha titulo: sem ele o titulo
                         // ja e a pasta, e a linha se repetiria.
                         if session.title != nil {
@@ -2531,7 +3212,9 @@ struct SessionsCard: View {
             } else {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 8) {
-                        ForEach(store.sessions) { SessionRow(session: $0) }
+                        ForEach(store.sessions) {
+                            SessionRow(session: $0, showAccount: store.multiAccount)
+                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -2575,28 +3258,24 @@ struct PanelView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
-                Image(nsImage: MenuIcon.image(state: store.headline, text: "",
-                                              textColor: .labelColor,
+                Image(nsImage: MenuIcon.image(state: store.headline, lines: [],
                                               phase: store.pulse.phase))
                     .renderingMode(.original)
                 Text("Claude Code").font(.headline)
                 Spacer()
-                Text(sourceLabel).font(.caption2).foregroundStyle(.secondary)
+                // Com varias contas cada cartao carrega a propria origem e idade:
+                // um rotulo unico no topo falaria por todas e mentiria para as
+                // que estao mais velhas.
+                if !store.multiAccount {
+                    Text(store.usage.sourceNote).font(.caption2).foregroundStyle(.secondary)
+                }
             }
 
-            Card {
-                LimitBar(title: "Sessão de 5h", limit: store.usage.fiveHour,
-                         dimmed: store.usage.isStale)
-                LimitBar(title: "Semana (7d)", limit: store.usage.sevenDay,
-                         dimmed: store.usage.isStale)
-                if let extra = store.usage.extra { ExtraUsageRow(extra: extra) }
-                if let note = store.apiStatus.note {
-                    Text(note).font(.caption2).foregroundStyle(.secondary)
-                }
-                if store.usage.source == .none {
-                    Text("Sem dados de limite ainda — abra uma sessão do Claude Code.")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
+            ForEach(store.accounts) { entry in
+                UsageCard(entry: entry,
+                          showHeader: store.multiAccount,
+                          note: entry.account.isDefault ? store.apiStatus.note : nil,
+                          onRename: { store.reload() })
             }
 
             CostCard(store: store)
@@ -2634,6 +3313,31 @@ struct PanelView: View {
                 }
             }
             Divider()
+            ForEach(BarEmphasis.allCases) { option in
+                Button {
+                    settings.barEmphasis = option
+                } label: {
+                    if option == settings.barEmphasis {
+                        Label(option.label, systemImage: "checkmark")
+                    } else {
+                        Text(option.label)
+                    }
+                }
+            }
+            // So aparece havendo o que escolher: com uma conta, um submenu de
+            // "qual conta" seria uma pergunta sem alternativa.
+            if store.multiAccount {
+                Divider()
+                Menu("Conta na barra") {
+                    accountChoice(Settings.barAccountActive, "Sessão ativa")
+                    accountChoice(Settings.barAccountBoth, "Ambas (duas linhas)")
+                    Divider()
+                    ForEach(store.accounts) { entry in
+                        accountChoice(entry.id, "\(entry.account.tag) — \(entry.account.name)")
+                    }
+                }
+            }
+            Divider()
             Button {
                 settings.animateIcon.toggle()
                 // Aplica na hora em vez de esperar o proximo tick de 5s.
@@ -2652,13 +3356,19 @@ struct PanelView: View {
         .fixedSize()
     }
 
-    /// Origem + idade do dado. Um numero congelado nunca deve se passar por vivo
-    /// -- e o que separa um painel confiavel de um que engana.
-    private var sourceLabel: String {
-        guard let at = store.usage.at else { return store.usage.source.label }
-        let secs = Int(Date().timeIntervalSince(at))
-        let age = secs < 60 ? "agora" : (secs < 3600 ? "há \(secs / 60)min" : "há \(secs / 3600)h")
-        return "\(store.usage.source.label) · \(age)"
+    /// Item do submenu de conta, com o mesmo check no proprio item que os modos
+    /// usam -- um Picker aqui viraria mais um nivel de submenu.
+    @ViewBuilder
+    private func accountChoice(_ value: String, _ label: String) -> some View {
+        Button {
+            settings.barAccount = value
+        } label: {
+            if settings.barAccount == value {
+                Label(label, systemImage: "checkmark")
+            } else {
+                Text(label)
+            }
+        }
     }
 }
 
@@ -2691,8 +3401,7 @@ struct MenuBarLabel: View {
         // .original: sem isso o SwiftUI trata a imagem como template e joga
         // fora as cores de estado.
         Image(nsImage: MenuIcon.image(state: store.headline,
-                                      text: store.menuText,
-                                      textColor: store.menuTextColor,
+                                      lines: store.menuLines,
                                       phase: pulse.phase))
             .renderingMode(.original)
     }

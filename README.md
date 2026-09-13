@@ -20,9 +20,13 @@ Quatro fontes, da mais viva para a mais teimosa:
 
 | Componente | Lê | Escreve | Rede |
 |---|---|---|---|
-| `statusline.py` | stdin do Claude Code | `~/.claude/claude-bar/` | nenhuma |
-| `hook.py` | stdin do Claude Code | `~/.claude/claude-bar/` | nenhuma |
-| `ClaudeBarLocal.app` | Keychain (via `security`) + `~/.claude.json` + `~/.claude/claude-bar/` + `~/.claude/projects/**/*.jsonl` + `~/.claude/ide/*.lock` + `~/Library/Application Support/Claude/plan-usage-history.json` | `~/Library/Preferences/local.claudebar.plist` | 1 `GET`, a cada 5 min |
+| `statusline.py` | stdin do Claude Code | `<config dir>/claude-bar/` | nenhuma |
+| `hook.py` | stdin do Claude Code | `<config dir>/claude-bar/` | nenhuma |
+| `ClaudeBarLocal.app` | Keychain (via `security`) + `<config dir>/.claude.json` + `<config dir>/claude-bar/` + `<config dir>/projects/**/*.jsonl` + `<config dir>/ide/*.lock` + `~/Library/Application Support/Claude/plan-usage-history.json` | `~/Library/Preferences/local.claudebar.plist` | 1 `GET`, a cada 5 min |
+
+`<config dir>` é `~/.claude` quando você tem uma conta só. Com mais de uma, cada
+conta tem o seu (`CLAUDE_CONFIG_DIR`) e nada atravessa de uma para a outra — ver
+[Duas contas](#duas-contas-ou-mais).
 
 Três subprocessos, os três somente-leitura: `/usr/bin/security` para o token (a
 cada 5 min); `/bin/ps` e `/usr/sbin/lsof` para descobrir a janela do editor que
@@ -184,6 +188,96 @@ grep -n "credentials\|sessionKey\|sk-a[n]t" statusline.py hook.py || echo "sem c
 
 ---
 
+## Duas contas (ou mais)
+
+Se você usa uma conta na extensão do VS Code e outra no terminal — pessoal e da
+empresa, tipicamente —, o painel mostra **as duas**, uma abaixo da outra, e a
+menu bar mostra a da sessão que você está usando.
+
+O que torna isso possível sem nenhuma adivinhação é como o próprio Claude Code
+separa conta: por **config dir**. A padrão mora em `~/.claude` (com o
+`~/.claude.json` ao lado); qualquer outra vive inteira dentro do
+`CLAUDE_CONFIG_DIR` que você apontar — `.claude.json`, `projects/`, `ide/` e o
+`claude-bar/` que os scripts escrevem. Então a conta de um dado **é o diretório
+de onde ele veio**, nunca um palpite sobre qual sessão o produziu.
+
+```bash
+# a conta da empresa, no terminal
+export CLAUDE_CONFIG_DIR=~/.claude-empresa
+
+# instala em todas as contas que o app enxerga
+./install.sh --all-accounts
+```
+
+A letra identifica quem é quem. Por padrão ela é posicional — **P** para a conta
+padrão (`~/.claude`), **E** para as demais — e aparece na menu bar, no cabeçalho de
+cada cartão do painel e na linha de cada sessão. Só quando há mais de uma conta:
+com uma só, a barra fica exatamente como era, porque letra sem ambiguidade para
+resolver é ruído ocupando largura.
+
+**P/E é só o ponto de partida.** Clique no cabeçalho de qualquer cartão do painel
+e escreva a letra (até 3 caracteres) e o nome que fizerem sentido para você —
+`AC` / *Cliente Acme*, `T2` / *Time 2*, o que for. Vale para quem tem duas contas
+de cliente, ou três, e não a divisão pessoal/empresa que o padrão supõe:
+
+```
+[E] voce@empresa.com   ✏️     ← clique no cabeçalho do cartão
+[AC] Cliente Acme             ← e a barra passa a dizer AC
+```
+
+Campo vazio apaga a personalização e a conta volta ao padrão — não há botão
+"restaurar" porque não é preciso. Os apelidos ficam em `UserDefaults`, indexados
+pelo `accountUuid`: o custo acumulado continua indexado pelo **id**, não pela
+letra, então renomear não deixa histórico órfão.
+
+```
+🤖 E 31%          ← a sessão ativa é a da empresa
+🤖 P 54%          ← você voltou para a sessão do VS Code
+```
+
+Por padrão a barra segue a sessão ativa, mas dá para fixar uma conta ou mostrar
+as duas empilhadas — ver [Qual conta a barra mostra](#qual-conta-a-barra-mostra).
+
+Como cada fonte se comporta com duas contas:
+
+| Fonte | Por conta? | Como |
+|---|---|---|
+| `cachedUsageUtilization` | sim | cada config dir tem o seu `.claude.json`, com `accountUuid` dentro |
+| statusline (`usage.json`) | sim | cada conta escreve no `claude-bar/` do próprio config dir |
+| `plan-usage-history.json` | sim | o arquivo é um só, mas cada amostra é carimbada com a `org` |
+| API (`/api/oauth/usage`) | **não** | só a conta padrão — ver abaixo |
+
+A API cobre apenas a conta padrão, e é uma limitação deliberada: o token sai do
+item `Claude Code-credentials` do Keychain, que é o da instalação padrão. Um
+config dir próprio guarda a credencial dele em **outro** item, cujo nome este
+projeto ainda não confirmou — e atribuir a resposta da API à conta errada seria
+pior do que a conta extra ficar sem essa fonte. Na prática ela não sente falta:
+a conta extra costuma ser a do terminal, onde a statusline roda a cada prompt com
+`rate_limits` vindo do próprio Claude Code, mais fresco que qualquer poleio.
+
+O filtro por `org` no histórico do app nativo não é zelo: o app poleia a conta em
+que **ele** está logado. Sem separar, a série de uma conta apareceria debaixo do
+nome da outra — número errado com cara de fresco, que é o pior estado possível
+deste painel. Sem org conhecida, a conta simplesmente não herda série nenhuma.
+
+> **O que muda de risco.** O script é o mesmo e continua sem rede, sem credencial
+> e sem decidir permissão. O que muda é o que passa por ele: com a segunda conta
+> instalada, `debug.jsonl` (quando ligado) e o título da sessão na menu bar
+> passam a carregar material daquela conta. Por isso o estado vive **dentro do
+> config dir de cada uma** — inclusive a flag `DEBUG`, que é por conta: ligar o
+> diagnóstico numa não captura conversa da outra.
+
+### Como as contas são descobertas
+
+`~/.claude` sempre, mais os irmãos `~/.claude-*` que tenham um `.claude.json`
+dentro. É a convenção que se usa na prática, e o custo de errar é assimétrico: um
+config dir fora do `$HOME` apenas não aparece no painel, enquanto adivinhar mais
+que isso poria o número de uma conta debaixo do nome de outra. Uma cópia de
+backup com `.claude.json` dentro entraria na lista — é por isso que cada cartão
+mostra o e-mail da conta, e não só a letra.
+
+---
+
 ## Instalação
 
 Os arquivos ficam todos na raiz do repositório — não há subpastas.
@@ -204,9 +298,16 @@ Os arquivos ficam todos na raiz do repositório — não há subpastas.
 
 ```bash
 ./install.sh --dry-run     # mostra exatamente o que mudaria, sem tocar em nada
-./install.sh               # aplica
+./install.sh               # aplica (só a conta padrão)
 ./install.sh --autostart   # idem, e ainda instala em /Applications + sobe no login
+
+./install.sh --all-accounts              # todas as contas achadas
+./install.sh --config-dir ~/.claude-empresa   # uma conta específica (pode repetir)
 ```
+
+Sem `--config-dir` ou `--all-accounts`, só a conta padrão é tocada: instalar
+sozinho hooks numa conta que o dono da máquina não pediu seria decidir por ele
+onde eles rodam.
 
 Faz os quatro passos manuais abaixo, e o terceiro — mesclar o `settings.json` —
 com as garantias que o `cp` não tem:
@@ -232,6 +333,10 @@ mkdir -p ~/.claude/claude-bar && chmod 700 ~/.claude/claude-bar
 cp statusline.py hook.py ~/.claude/claude-bar/
 chmod +x ~/.claude/claude-bar/*.py
 ```
+
+Para outra conta, troque `~/.claude` pelo `CLAUDE_CONFIG_DIR` dela em todos os
+caminhos deste passo e do próximo — inclusive dentro dos comandos do
+`settings.json`, que apontam para os scripts do próprio config dir.
 
 ### 2. `~/.claude/settings.json`
 
@@ -317,15 +422,18 @@ git config core.hooksPath .githooks
 ```
 
 A cada commit ele olha o que mudou e faz só o necessário: `statusline.py` ou
-`hook.py` mudaram, recopia para `~/.claude/claude-bar`; `ClaudeBarLocal.swift`
-mudou, roda o `build.sh`, substitui o bundle em `/Applications` e reinicia o
-serviço. Commit que mexe só em documentação não recompila nada.
+`hook.py` mudaram, recopia para o `claude-bar/` de **cada conta que já os tenha**;
+`ClaudeBarLocal.swift` mudou, roda o `build.sh`, substitui o bundle em
+`/Applications` e reinicia o serviço. Commit que mexe só em documentação não
+recompila nada.
 
 Três detalhes que o hook não improvisa:
 
-- **Não chama o `install.sh`.** Ele refaria o merge do `settings.json` e
-  reinstalaria o LaunchAgent a cada commit; o hook toca apenas o que muda de um
-  commit para o outro.
+- **Não chama o `install.sh`, e não instala em conta nova.** Ele refaria o merge
+  do `settings.json` e reinstalaria o LaunchAgent a cada commit; o hook toca
+  apenas o que muda de um commit para o outro, e só em contas onde os scripts já
+  estão. Registrar hooks globais numa conta que ninguém pediu, a partir de um
+  commit, seria exatamente a surpresa que este projeto existe para não dar.
 - **Reinicia com `launchctl kickstart -k`, não com `open`.** O processo precisa
   continuar sendo filho do agent — um `open` avulso ficaria órfão e o `launchd`
   o mataria no login seguinte.
@@ -558,6 +666,39 @@ limite virado sobra o relógio, sem `resets_at` sobra a porcentagem. É o modo m
 largo da lista — vale a pena se você tem espaço na barra, incomoda se a sua já
 está cheia.
 
+O modo é uma escolha; **qual conta** ele descreve é outra, e as duas se combinam
+livremente.
+
+### Qual conta a barra mostra
+
+Com mais de uma conta, a letra dela entra na frente (`E 31%`, `P 54% | 2h14`) e
+um segundo menu aparece no rodapé do painel, em **Menu bar → Conta na barra**:
+
+| Escolha | Barra |
+|---|---|
+| Sessão ativa (padrão) | a conta da sessão que o robô está descrevendo |
+| Ambas (duas linhas) | as duas empilhadas, em corpo menor |
+| `P — seu@email` / `E — …` | sempre aquela conta, mude você de sessão ou não |
+
+*Sessão ativa* segue a sessão que manda no ícone — não a mais recente nem a que
+está pior. Ícone e número falando de sessões diferentes deixaria a barra dizendo
+que uma conta está travada enquanto mostra a porcentagem da outra.
+
+*Ambas* empilha as duas linhas dentro dos mesmos 18pt de altura do item, em 8,5pt
+semibold: 12pt não cabe duas vezes, e o peso compensa o corpo menor. Cada linha
+tem o **seu** destaque — marcar as duas pela pior esconderia justamente qual delas
+está doendo.
+
+```
+🤖 P 100%          ← vermelho: a pessoal estourou a janela
+   E 31%
+```
+
+Com uma conta só, nada disso aparece: sem ambiguidade para resolver, letra e
+submenu seriam ruído. No modo *Custo de hoje* o número também passa a ser por
+conta quando há mais de uma — a letra na frente promete que aquele valor é daquele
+login, e um total somado ali desmentiria a promessa.
+
 Os dígitos são monoespaçados de propósito: sem isso o item mudaria de largura a
 cada ponto percentual e empurraria os vizinhos da barra.
 
@@ -565,17 +706,44 @@ Sessão esperando decisão não troca o que está escrito: quem avisa é o robô
 fica laranja e pisca. O texto é o único lugar onde a porcentagem cabe, e ela não
 pode sumir justamente na hora em que está alta.
 
-Acima de 85% a porcentagem fica vermelha — um coral no modo escuro, mais claro
-que o `systemRed`, que sobre wallpaper escuro lia como borrão em vez de alerta.
+### Como o limite alto aparece
+
+Acima de 85% a barra realça o número, e o **como** é escolha sua, no mesmo menu:
+
+| Destaque | O que faz |
+|---|---|
+| Etiqueta *(padrão)* | o número vai dentro de uma pílula vermelha sólida, em branco |
+| Cor no número | o número fica vermelho, sem fundo |
+| Nenhum | o número não muda; quem avisa é só o robô |
+
+A etiqueta é o padrão por um motivo mecânico: **o fundo da menu bar é o seu
+wallpaper**, não uma superfície controlada. Texto vermelho depende de sorte com o
+que estiver atrás — sobre um fundo escuro azulado ele tem luminância vizinha à do
+fundo e lê como borrão justamente no estado que mais precisa ser lido, e em 8,5pt
+(as duas linhas do modo *Ambas*) piora. A etiqueta leva o próprio fundo: o
+contraste que importa passa a ser branco-sobre-vermelho, que não depende de nada.
+
+*Cor no número* é o comportamento anterior, preservado para quem prefere a barra
+sem blocos sólidos — ele usa um coral no modo escuro e um carmim no claro, mais
+legíveis que o `systemRed`. Aviso de 60% a 85% continua em laranja de texto nos
+dois modos: laranja tem luminância alta e não sofre do mesmo problema, e duas
+cores sólidas na barra ao mesmo tempo competiriam entre si.
+
+Dado velho nunca ganha destaque, em modo nenhum: alarmar sobre um número
+congelado é alarmar sobre um estado que talvez nem exista mais.
 
 ---
 
 ## Custo e tokens
 
 Quarta fonte de dados, independente das outras três e a única que não depende de
-nada além do disco: os transcripts em `~/.claude/projects/**/*.jsonl`. Cada
+nada além do disco: os transcripts em `<config dir>/projects/**/*.jsonl`. Cada
 mensagem do assistente carrega o `usage` completo (entrada, saída, escrita e
 leitura de cache, com o TTL separado) e o `cwd` do projeto.
+
+Com duas contas, o `projects/` de cada uma é varrido e o painel ganha um
+detalhamento **Por conta**, acima de *Por projeto* — que é a primeira pergunta
+quando o mesmo projeto aparece nas duas.
 
 **Sem rede e sem credencial.** O preço é tabela fixa no código, com os quatro
 preços de cache derivados do preço de entrada por multiplicadores da Anthropic —
@@ -632,6 +800,10 @@ python3 -m json.tool < ~/.claude/claude-bar/debug.jsonl   # uma linha por evento
 rm ~/.claude/claude-bar/DEBUG ~/.claude/claude-bar/debug.jsonl
 ```
 
+A flag é **por conta**: ela vale para o config dir em que está. Ligar o
+diagnóstico na conta pessoal não faz o stdin cru da conta da empresa parar no
+mesmo arquivo — para capturar a outra, `touch` no `claude-bar/` dela.
+
 Útil para descobrir se `notification_type` existe na sua versão e quais valores
 ele assume.
 
@@ -677,7 +849,9 @@ terminal compatível: Ghostty, WezTerm, iTerm2 ou Kitty. Terminal.app não supor
 
 Remove os hooks e a `statusLine` **deste projeto** do `settings.json` (com backup,
 e sem encostar no que for seu), descarrega o LaunchAgent, apaga o app de
-`/Applications` e o `~/.claude/claude-bar`. À mão, se preferir:
+`/Applications` e o `~/.claude/claude-bar`. Ele respeita as mesmas opções de
+conta da instalação: sem elas, desinstala só da conta padrão — use
+`--all-accounts` para tirar de todas. À mão, se preferir:
 
 ```bash
 launchctl bootout gui/$(id -u)/local.claudebar 2>/dev/null
@@ -712,6 +886,21 @@ os hooks sem apagar nada (a statusline é configuração separada e continua).
   do item é refeita a cada refresh de token e não guarda a sua resposta.
 - Sessões cujo terminal foi fechado à força não disparam `SessionEnd`; o app
   ignora arquivos parados há mais de 6h.
+- **A API cobre só a conta padrão** (ver [Duas contas](#duas-contas-ou-mais)): o
+  nome do item de Keychain de um `CLAUDE_CONFIG_DIR` próprio não está confirmado,
+  e chutar poria o número de uma conta debaixo do nome de outra. As contas extras
+  vivem das outras três fontes.
+- **Contas são descobertas por convenção** — `~/.claude` e os irmãos `~/.claude-*`
+  com `.claude.json` dentro. Um config dir fora do `$HOME` não aparece no painel;
+  uma cópia de backup com `.claude.json` dentro aparece (com o e-mail dela, que é
+  como você percebe).
+- **Sem Xcode, o SDK mais novo pode não compilar.** O SwiftUI do SDK 27 declara
+  `@State` como macro, e o plugin que expande macro (`libSwiftUIMacros.dylib`) só
+  vem com o Xcode completo — nos Command Line Tools sozinhos o build morre em
+  `plugin for module 'SwiftUIMacros' not found`, mesmo em código que compilava na
+  véspera. O `build.sh` detecta isso com um probe de 0,35s e cai para o SDK mais
+  novo que ainda funcione; se nenhum funcionar, ele diz para instalar o Xcode em
+  vez de despejar erro de compilação.
 - O app é assinado ad-hoc: roda porque você mesmo compilou, mas não é notarizado
   e não deve ser distribuído para outras máquinas assim.
 

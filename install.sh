@@ -9,8 +9,16 @@
 # Uso:
 #   ./install.sh                 instala (scripts + settings.json + app)
 #   ./install.sh --autostart     idem, e sobe no login via LaunchAgent
+#   ./install.sh --all-accounts  instala em todas as contas achadas (ver abaixo)
+#   ./install.sh --config-dir D  instala na conta cujo CLAUDE_CONFIG_DIR e D
+#                                (pode repetir; sem isso, so a conta padrao)
 #   ./install.sh --dry-run       mostra o que mudaria, sem tocar em nada
-#   ./install.sh --uninstall     desfaz tudo
+#   ./install.sh --uninstall     desfaz tudo (respeita --config-dir/--all-accounts)
+#
+# Sobre contas: o Claude Code separa conta por config dir -- a padrao em
+# ~/.claude e as demais no CLAUDE_CONFIG_DIR que voce apontar. Os scripts e os
+# hooks sao instalados *por conta*, e cada uma escreve o estado dentro do
+# proprio config dir. O app le todas.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -18,27 +26,78 @@ cd "$(dirname "$0")"
 AUTOSTART=0
 DRY_RUN=0
 UNINSTALL=0
+ALL_ACCOUNTS=0
+CONFIG_DIRS=()
 
-for arg in "$@"; do
-  case "$arg" in
-    --autostart) AUTOSTART=1 ;;
-    --dry-run)   DRY_RUN=1 ;;
-    --uninstall) UNINSTALL=1 ;;
+# Descobre os config dirs como o app descobre: a conta padrao, mais os irmaos
+# ".claude-*" que tenham um .claude.json dentro. Mesma convencao dos dois lados,
+# de proposito -- instalar num diretorio que o app nao olha seria trabalho que
+# nao aparece.
+discover_config_dirs() {
+  printf '%s\n' "$HOME/.claude"
+  for dir in "$HOME"/.claude-*/; do
+    [ -d "$dir" ] || continue
+    [ -f "${dir}.claude.json" ] || continue
+    printf '%s\n' "${dir%/}"
+  done
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --autostart)    AUTOSTART=1 ;;
+    --dry-run)      DRY_RUN=1 ;;
+    --uninstall)    UNINSTALL=1 ;;
+    --all-accounts) ALL_ACCOUNTS=1 ;;
+    --config-dir)
+      [ $# -ge 2 ] || { echo "--config-dir precisa de um caminho (use --help)" >&2; exit 1; }
+      CONFIG_DIRS+=("${2%/}")
+      shift ;;
+    --config-dir=*) CONFIG_DIRS+=("${1#--config-dir=}") ;;
     -h|--help)
-      sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *)
-      echo "argumento desconhecido: $arg (use --help)" >&2
+      echo "argumento desconhecido: $1 (use --help)" >&2
       exit 1 ;;
   esac
+  shift
 done
 
-STATE_DIR="$HOME/.claude/claude-bar"
-SETTINGS="$HOME/.claude/settings.json"
+if [ "$ALL_ACCOUNTS" = "1" ]; then
+  while IFS= read -r dir; do CONFIG_DIRS+=("$dir"); done < <(discover_config_dirs)
+fi
+# Sem escolha explicita, so a conta padrao: instalar sozinho em conta que o dono
+# da maquina nao pediu seria decidir por ele onde os hooks rodam.
+[ ${#CONFIG_DIRS[@]} -gt 0 ] || CONFIG_DIRS=("$HOME/.claude")
+
+# Repetido (--all-accounts junto de --config-dir) vira uma entrada so, mantendo
+# a ordem em que apareceu.
+UNIQUE_DIRS=()
+for dir in "${CONFIG_DIRS[@]}"; do
+  seen=0
+  for kept in ${UNIQUE_DIRS[@]+"${UNIQUE_DIRS[@]}"}; do
+    [ "$kept" = "$dir" ] && seen=1 && break
+  done
+  [ "$seen" = "0" ] && UNIQUE_DIRS+=("$dir")
+done
+CONFIG_DIRS=("${UNIQUE_DIRS[@]}")
+
 AGENT="$HOME/Library/LaunchAgents/local.claudebar.plist"
 APP="ClaudeBarLocal.app"
 INSTALLED_APP="/Applications/$APP"
 LABEL="local.claudebar"
+
+# HOME de teste nao pode tocar no que mora fora do HOME.
+#
+# A verificacao deste script e rodar com HOME falso (`HOME=/tmp/fake ./install.sh`),
+# e isso redireciona ~/.claude e o LaunchAgent -- mas nao /Applications, que nao
+# fica debaixo do HOME. Sem esta guarda, um `--uninstall` de teste apaga o app
+# realmente instalado e mata o processo de quem esta usando: aconteceu. Com HOME
+# diferente do real, tudo o que e global fica de fora.
+REAL_HOME="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+[ -n "$REAL_HOME" ] || REAL_HOME="/Users/$(id -un)"
+SANDBOXED=0
+[ "$HOME" = "$REAL_HOME" ] || SANDBOXED=1
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n\033[1m%s\033[0m\n' "$*"; }
@@ -46,12 +105,13 @@ warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
 
 # O merge (e o unmerge) do settings.json. Fica numa funcao porque instalar e
-# desinstalar usam exatamente a mesma logica, so mudando o modo.
-merge_settings() {  # $1 = install|uninstall
-  python3 - "$SETTINGS" "$1" "$DRY_RUN" <<'PY'
+# desinstalar usam exatamente a mesma logica, so mudando o modo -- e porque agora
+# ela roda uma vez por conta.
+merge_settings() {  # $1 = install|uninstall, $2 = settings.json, $3 = dir dos scripts
+  python3 - "$2" "$1" "$DRY_RUN" "$3" <<'PY'
 import json, os, shutil, sys, time
 
-path, mode, dry = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+path, mode, dry, scripts = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4]
 
 # Marcadores: e por eles que o script reconhece o que e dele. Qualquer outra
 # statusline ou hook seu nao casa, e por isso nunca e tocado.
@@ -62,14 +122,16 @@ EVENTS = ["SessionStart", "UserPromptSubmit", "PermissionRequest",
           "PermissionDenied", "PostToolUse", "PostToolUseFailure",
           "Notification", "Stop", "SessionEnd"]
 
+# O caminho e o da conta que esta sendo instalada -- cada settings.json aponta
+# para os scripts do proprio config dir, e nao para uma copia central.
 STATUSLINE = {"type": "command",
-              "command": "python3 ~/.claude/claude-bar/statusline.py",
+              "command": "python3 %s/statusline.py" % scripts,
               "padding": 1,
               "refreshInterval": 10}
 
 def hook_entry():
     return {"hooks": [{"type": "command",
-                       "command": "python3 ~/.claude/claude-bar/hook.py",
+                       "command": "python3 %s/hook.py" % scripts,
                        "async": True}]}
 
 def is_ours(obj):
@@ -201,7 +263,10 @@ if [ "$UNINSTALL" = "1" ]; then
   [ "$DRY_RUN" = "1" ] && warn "modo --dry-run: nada sera alterado."
 
   step "1/4  settings.json"
-  merge_settings uninstall
+  for dir in "${CONFIG_DIRS[@]}"; do
+    say "  ${dir/#$HOME/~}"
+    merge_settings uninstall "$dir/settings.json" "${dir/#$HOME/~}/claude-bar"
+  done
 
   step "2/4  LaunchAgent"
   if [ -f "$AGENT" ]; then
@@ -217,7 +282,9 @@ if [ "$UNINSTALL" = "1" ]; then
   fi
 
   step "3/4  App"
-  if [ "$DRY_RUN" = "1" ]; then
+  if [ "$SANDBOXED" = "1" ]; then
+    say "  pulado (HOME de teste: nao encerra nem remove o app real)"
+  elif [ "$DRY_RUN" = "1" ]; then
     say "  [dry-run] encerraria o app e removeria $INSTALLED_APP"
   else
     pkill -f "$APP/Contents/MacOS/ClaudeBarLocal" 2>/dev/null || true
@@ -226,12 +293,15 @@ if [ "$UNINSTALL" = "1" ]; then
   fi
 
   step "4/4  Estado em disco"
-  if [ "$DRY_RUN" = "1" ]; then
-    say "  [dry-run] removeria $STATE_DIR"
-  else
-    rm -rf "$STATE_DIR"
-    say "  $STATE_DIR removido (scripts, usage.json, sessoes)"
-  fi
+  for dir in "${CONFIG_DIRS[@]}"; do
+    state="$dir/claude-bar"
+    if [ "$DRY_RUN" = "1" ]; then
+      say "  [dry-run] removeria ${state/#$HOME/~}"
+    else
+      rm -rf "$state"
+      say "  $state removido (scripts, usage.json, sessoes)"
+    fi
+  done
 
   say ""
   say "Pronto. Reinicie as sessoes do Claude Code abertas para os hooks sairem de vez."
@@ -276,37 +346,48 @@ for f in ('statusline.py','hook.py'):
     ast.parse(open(f, encoding='utf-8').read(), f)" || die "statusline.py/hook.py nao compilam. Nada foi instalado."
 say "  scripts       sintaxe ok"
 
-# O settings.json e conferido aqui, e nao la no passo 3, para um arquivo quebrado
-# abortar antes de qualquer copia -- desistir no meio deixaria scripts instalados
-# sem hook nenhum apontando para eles.
-if [ -f "$SETTINGS" ]; then
-  python3 -c "
+# Os settings.json sao conferidos aqui, e nao la no passo 3, para um arquivo
+# quebrado abortar antes de qualquer copia -- desistir no meio deixaria scripts
+# instalados sem hook nenhum apontando para eles. Vale para todas as contas: o
+# JSON quebrado da segunda nao pode ser descoberto depois de mexer na primeira.
+say "  contas        ${#CONFIG_DIRS[@]} (${CONFIG_DIRS[*]/#$HOME/~})"
+for dir in "${CONFIG_DIRS[@]}"; do
+  settings="$dir/settings.json"
+  if [ -f "$settings" ]; then
+    python3 -c "
 import json,sys
 text = open(sys.argv[1], encoding='utf-8').read()
 if text.strip():
     d = json.loads(text)
     if not isinstance(d, dict): raise SystemExit('raiz nao e objeto')
-" "$SETTINGS" 2>/dev/null \
-    || die "  settings.json  NAO e JSON valido: $SETTINGS
+" "$settings" 2>/dev/null \
+      || die "  settings.json  NAO e JSON valido: $settings
                 Nada foi instalado. Conserte o arquivo (ou renomeie) e rode de novo."
-  say "  settings.json ok"
-else
-  say "  settings.json sera criado"
-fi
+    say "  settings.json ok        ${settings/#$HOME/~}"
+  else
+    say "  settings.json sera criado  ${settings/#$HOME/~}"
+  fi
+done
 
-step "2/5  Scripts -> $STATE_DIR"
-if [ "$DRY_RUN" = "1" ]; then
-  say "  [dry-run] copiaria statusline.py e hook.py"
-else
-  mkdir -p "$STATE_DIR"
-  chmod 700 "$STATE_DIR"
-  cp statusline.py hook.py "$STATE_DIR/"
-  chmod +x "$STATE_DIR/statusline.py" "$STATE_DIR/hook.py"
-  say "  copiados (diretorio 0700)"
-fi
+step "2/5  Scripts"
+for dir in "${CONFIG_DIRS[@]}"; do
+  state="$dir/claude-bar"
+  if [ "$DRY_RUN" = "1" ]; then
+    say "  [dry-run] copiaria statusline.py e hook.py -> ${state/#$HOME/~}"
+  else
+    mkdir -p "$state"
+    chmod 700 "$state"
+    cp statusline.py hook.py "$state/"
+    chmod +x "$state/statusline.py" "$state/hook.py"
+    say "  ${state/#$HOME/~}  (diretorio 0700)"
+  fi
+done
 
 step "3/5  settings.json"
-merge_settings install
+for dir in "${CONFIG_DIRS[@]}"; do
+  say "  ${dir/#$HOME/~}"
+  merge_settings install "$dir/settings.json" "${dir/#$HOME/~}/claude-bar"
+done
 
 step "4/5  App"
 if [ "$DRY_RUN" = "1" ]; then
@@ -314,11 +395,13 @@ if [ "$DRY_RUN" = "1" ]; then
 else
   ./build.sh >/dev/null || die "build falhou. Rode ./build.sh direto para ver o erro."
   say "  compilado: $(pwd)/$APP"
-  pkill -f "$APP/Contents/MacOS/ClaudeBarLocal" 2>/dev/null || true
+  [ "$SANDBOXED" = "1" ] || pkill -f "$APP/Contents/MacOS/ClaudeBarLocal" 2>/dev/null || true
 fi
 
 step "5/5  Auto-start"
-if [ "$AUTOSTART" = "1" ]; then
+if [ "$SANDBOXED" = "1" ]; then
+  say "  pulado (HOME de teste: nao instala em /Applications)"
+elif [ "$AUTOSTART" = "1" ]; then
   if [ "$DRY_RUN" = "1" ]; then
     say "  [dry-run] instalaria em /Applications e carregaria o LaunchAgent"
   else
@@ -340,7 +423,7 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
-if [ "$AUTOSTART" != "1" ]; then
+if [ "$AUTOSTART" != "1" ] && [ "$SANDBOXED" != "1" ]; then
   open "$APP"
 fi
 

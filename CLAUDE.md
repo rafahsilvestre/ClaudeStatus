@@ -5,8 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## O que é
 
 Monitor de menu bar do Claude Code para macOS 13+. Três peças que se comunicam
-por arquivos em `~/.claude/claude-bar/`, sem servidor, sem daemon próprio e sem
-dependência de terceiro:
+por arquivos em `<config dir>/claude-bar/`, sem servidor, sem daemon próprio e
+sem dependência de terceiro. `<config dir>` é `~/.claude` para a conta padrão e
+o `CLAUDE_CONFIG_DIR` de cada conta extra — ver *Contas* abaixo:
 
 - `ClaudeBarLocal.swift` — o app inteiro num arquivo (~2.5k linhas, dividido por
   `// MARK:`). SwiftUI + AppKit, compilado direto por `swiftc`, sem projeto Xcode.
@@ -37,10 +38,20 @@ pkill -f "ClaudeBarLocal.app/Contents/MacOS/ClaudeBarLocal"; open ClaudeBarLocal
 git config core.hooksPath .githooks   # uma vez por clone; veja abaixo
 
 # ver o JSON cru que o Claude Code manda nos hooks/statusline desta versão
+# (a flag é por conta: vale para o config dir em que está)
 touch ~/.claude/claude-bar/DEBUG   # ... use o Claude Code ... depois:
 python3 -m json.tool < ~/.claude/claude-bar/debug.jsonl
 rm ~/.claude/claude-bar/DEBUG ~/.claude/claude-bar/debug.jsonl
+
+./install.sh --all-accounts   # instala em todas as contas achadas
+./install.sh --config-dir ~/.claude-empresa   # numa conta específica
 ```
+
+O `swiftc -typecheck` acima falha com `plugin for module 'SwiftUIMacros' not
+found` em máquina sem Xcode: o SwiftUI do SDK 27 declara `@State` como macro e o
+plugin que expande macro não vem nos Command Line Tools. O `build.sh` já contorna
+(probe + fallback de SDK); para o typecheck avulso, acrescente o mesmo
+`-sdk /Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk`.
 
 Com auto-start ligado, quem roda é `/Applications/ClaudeBarLocal.app`, não o
 bundle da pasta — `./build.sh` sozinho não alcança o `launchd`.
@@ -62,10 +73,54 @@ durante rebase/merge. Detalhes e justificativas na seção 5 do README.
 
 ## Arquitetura
 
+### Contas: o diretório é a identidade
+
+O Claude Code separa conta por **config dir** (`~/.claude` para a padrão, o
+`CLAUDE_CONFIG_DIR` para as demais), e tudo o que é por conta segue essa divisão:
+`.claude.json`, `projects/`, `ide/` e o `claude-bar/` dos scripts. `Accounts.scan`
+descobre `~/.claude` mais os irmãos `~/.claude-*` com `.claude.json` dentro, e lê
+identidade e cache de uso **num parse só** por arquivo (são ~60KB reescritos o
+tempo todo). A letra é posicional por padrão (`P` para a padrão, `E` para as
+extras), mas é só o ponto de partida: `Settings.accountTags`/`accountNames`
+guardam letra e nome escolhidos por conta, e `Accounts.scan` recebe esses
+apelidos como parâmetro — ler estado observável na fila de IO seria o atalho que
+só quebra em produção. Por isso o custo é indexado pelo **id** da conta, e não
+pela letra: renomear não pode deixar acumulado órfão.
+
+A consequência que não pode ser desfeita por refator: a conta de um dado é o
+diretório de onde ele veio, nunca inferência. Os scripts não carimbam conta
+nenhuma — eles só escrevem no `claude-bar/` do próprio config dir, e é o app que
+sabe de quem é o arquivo pelo caminho.
+
+Duas assimetrias reais entre as contas:
+
+- **API só na conta padrão.** O token sai do item `Claude Code-credentials`; um
+  config dir próprio guarda a credencial em outro item, de nome não confirmado.
+  Enquanto não confirmar, atribuir a resposta à conta errada seria pior que a
+  conta extra ficar sem a fonte — ela é coberta pela statusline, que no terminal
+  é mais fresca que a API.
+- **`plan-usage-history.json` é filtrado por `org`.** O arquivo é único e cada
+  amostra traz a org; sem filtrar, a série de uma conta apareceria debaixo do
+  nome da outra. Sem org conhecida, a conta não herda série — a exceção é a
+  padrão com arquivo do formato antigo (sem carimbo), onde não há o que confundir.
+
+A menu bar mostra uma conta por linha: por padrão a da sessão que manda no ícone
+(`Store.active`), com opção de fixar uma conta ou empilhar as duas em corpo menor
+(`Settings.barAccount`, desenhado em `MenuIcon.image`). A letra só aparece
+havendo mais de uma conta — barra de instalação de conta única fica como era.
+
+O realce de limite alto é `Settings.barEmphasis`, e o padrão (`.badge`) desenha
+uma etiqueta sólida em vez de texto colorido. O motivo é o mesmo que gerou o
+`barCritical`, levado às últimas consequências: o fundo da barra é o wallpaper, e
+texto vermelho depende de sorte com ele — pior ainda nos 8,5pt do modo empilhado.
+Etiqueta leva o próprio fundo, e o contraste vira branco-sobre-vermelho. Comparado
+com renderização lado a lado sobre fundo escuro, azul médio e claro.
+
 ### Quatro fontes de uso, escolhidas por frescor
 
-`Store` mantém **quatro snapshots separados** (`apiUsage`, `cacheUsage`,
-`historyUsage`, `fileUsage`) e `publishUsage()` publica o de carimbo mais novo —
+`Store` mantém **quatro snapshots separados por conta** (`Sources`: `api`,
+`cache`, `history`, `file`, indexados pelo id da conta) e `Store.merge` escolhe o
+de carimbo mais novo de cada uma —
 comparação por timestamp, nunca prioridade fixa, para o painel nunca andar para
 trás. As fontes, em ordem de vivacidade: API (`/api/oauth/usage`),
 `plan-usage-history.json` do app nativo do Claude, `cachedUsageUtilization` do
@@ -105,7 +160,8 @@ conta tokens e **não** inventa custo.
 
 ### Contrato entre os scripts e o app
 
-`hook.py` e `statusline.py` escrevem `~/.claude/claude-bar/sessions/<id>.json`;
+`hook.py` e `statusline.py` escrevem `<config dir>/claude-bar/sessions/<id>.json`
+(o config dir sai de `CLAUDE_CONFIG_DIR`, com `~/.claude` de padrão);
 `Store.readSessions()` lê. Os dois lados dependem de detalhes que não são
 óbvios de um lado só:
 
@@ -123,7 +179,7 @@ Escrita sempre atômica (tmp 0600 + `os.replace`), diretório 0700.
 
 `Reveal` sobe uma cadeia: processo do Claude Code daquela sessão (por
 `--resume=<id>` ou por `cwd` via `lsof`) → processo pai (extension host, um por
-janela) → porta TCP que ele escuta (`lsof`) → `~/.claude/ide/<porta>.lock` →
+janela) → porta TCP que ele escuta (`lsof`) → `<config dir da sessão>/ide/<porta>.lock` →
 `workspaceFolders`. Só abre raiz de janela conhecida; sem raiz confirmada,
 apenas ativa o app — pedir um caminho qualquer faria o editor abrir uma janela
 nova. Do `.lock` lê **apenas** `workspaceFolders`, nunca o `authToken`.
@@ -145,8 +201,11 @@ Estas não são preferências; cada uma custou um bug ou uma medição:
   naquele binário, e é refeita a cada refresh de token.
 - **Nunca renovar nem guardar o token.** O Claude Code é dono desse ciclo de
   vida; disputar isso invalida a sessão. Lê, usa, descarta.
-- **Nunca escrever em `~/.claude`** a partir do app. A única escrita dele é
-  `UserDefaults` (preferência de exibição).
+- **Nunca escrever em `~/.claude`** — nem em config dir nenhum — a partir do app.
+  A única escrita dele é `UserDefaults` (preferência de exibição).
+- **Nunca misturar fonte de contas diferentes no mesmo balde.** A comparação por
+  frescor só faz sentido entre números do mesmo dono; o dia em que ela escolher
+  entre contas, o painel mente com cara de fresco.
 - **Não baixar `apiInterval` (300s) nem remover o jitter/backoff.** O endpoint
   castiga polling com 429 de 30+ minutos, sem `Retry-After`.
 - **Manter o `User-Agent` `claude-code/<versão>`** — sem ele a requisição cai num
