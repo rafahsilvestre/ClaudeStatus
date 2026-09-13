@@ -122,6 +122,21 @@ venceu sem o zero ter sido observado.
 A janela de 7 dias fica de fora de propósito: ela quase nunca zera na série, e
 sem uma borda observada a mesma conta viraria extrapolação a partir de nada.
 
+**Quando nem a dedução sustenta, a API volta a ser consultada.** O poller fica em
+silêncio enquanto o histórico do app nativo está fresco — ele já cobre o painel de
+graça, e requisição a mais só aumenta a chance de 429. Só que o histórico carrega
+*porcentagem*, não agenda: numa conta que vive só na extensão do VS Code (a
+statusline nunca roda, e o `cachedUsageUtilization` dela envelhece), pode acontecer
+de as quatro fontes terem número e nenhuma ter data. Medido em 12/09: histórico
+fresco de 6 min, cache de 56h com data vencida, `usage.json` de 40 dias atrás, e a
+dedução em `nil` por um vão de 115 min na série. A barra mostrava `100%` sem
+relógio até alguém abrir o painel — abrir força o fetch, e o countdown aparecia
+"sozinho".
+
+A economia passou a exigir as duas coisas: histórico fresco **e** countdown já
+publicado. Sem agenda, a requisição tem o que melhorar e volta ao ritmo normal de
+300s com jitter — nunca abaixo dele, e o backoff de 429 continua acima de tudo.
+
 ### Por que não aparece o diálogo do Keychain
 
 O app lê o token assim:
@@ -660,6 +675,12 @@ O item mostra sempre o robô; o que vai escrito ao lado é escolha sua, em
 | Tempo até reiniciar | `2h14` — contagem regressiva da janela de 5h |
 | Uso + tempo até reiniciar | `54% \| 2h14` — os dois acima lado a lado |
 | Custo de hoje | `$32.63` |
+
+Com a conta em **0%** o relógio vira `ao usar` (`0% | ao usar`). Não é rodeio: a
+janela de 5h ancora no seu **primeiro uso** e morre 5h depois, então antes dele
+não existe hora nenhuma para contar — nem a API tem esse campo. O que existia
+antes era pior: o campo sumia, e `0%` sozinho na barra é indistinguível de um bug.
+No cartão a mesma situação aparece como *janela começa no próximo uso*.
 
 No modo combinado o separador só aparece quando os dois lados existem: com o
 limite virado sobra o relógio, sem `resets_at` sobra a porcentagem. É o modo mais

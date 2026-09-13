@@ -146,8 +146,10 @@ Duas regras sobre `resets_at`, ambas custaram um sintoma visível:
 
 Rede: `maybeFetchAPI()` dispara ao **abrir o painel** (piso de 60s), não por
 polling. O timer de 300s fica em silêncio enquanto o histórico do app nativo
-estiver fresco (`passiveFresh`). Um 429 vira backoff de 10→60 min e o painel se
-vira com disco.
+estiver fresco (`passiveFresh`) **e** houver countdown publicado (`hasLiveReset`)
+— a segunda metade existe porque o histórico só carrega porcentagem, e calar o
+poller por frescor do número deixava a conta sem `resets_at` até alguém abrir o
+painel. Um 429 vira backoff de 10→60 min e o painel se vira com disco.
 
 ### Custo e tokens — fonte independente
 

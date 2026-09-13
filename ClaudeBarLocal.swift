@@ -1101,7 +1101,14 @@ final class Store: ObservableObject {
 
     /// Contagem regressiva ate a janela de 5h virar. Minutos abaixo de uma hora,
     /// senao a barra ficaria mostrando "0h" por 59 minutos.
+    ///
+    /// Com uso zerado nao ha countdown porque nao ha janela: ela ancora no
+    /// primeiro uso e morre 5h depois, entao antes dele nao existe hora nenhuma
+    /// para contar. O campo diz "ao usar" em vez de sumir -- um campo que
+    /// desaparece le como dado faltando, e foi exatamente assim que a barra
+    /// pareceu quebrada: "0%" sozinho, sem nada do lado, indistinguivel de um bug.
     private func resetText(_ usage: Usage) -> String {
+        if let five = usage.fiveHour, five.pct == 0, five.resetsAt == nil { return "ao usar" }
         guard let five = usage.fiveHour, let at = five.resetsAt else { return "" }
         let secs = at.timeIntervalSinceNow
         guard secs > 0 else { return "0m" }
@@ -1397,6 +1404,42 @@ final class Store: ObservableObject {
     /// Claude Code -- mais fresco que qualquer poleio nosso.
     private var apiAccount: Account? { known.first(where: { $0.isDefault }) }
 
+    /// A agenda daquela conta ja esta resolvida? Ou ha countdown no futuro, ou nao
+    /// ha janela em curso para datar.
+    ///
+    /// Serve a uma condicao so -- a de calar o poller -- e existe porque calar por
+    /// frescor do *numero* ignorava que a *agenda* podia estar faltando.
+    ///
+    /// E a continuacao de f25ab6f: la, quando nenhuma fonte tinha data valida, o
+    /// painel passou a publicar sem countdown em vez de vestir uma agenda vencida,
+    /// e PlanHistory.inferReset cobriu a maioria desses casos deduzindo a janela.
+    /// Quando nem ele consegue, so a API tem a data -- e ela estava em silencio.
+    ///
+    /// Medido em 12/09, numa conta que so vive na extensao do VS Code: statusline
+    /// nunca roda (usage.json de 40 dias atras), cache com 56h, historico fresco de
+    /// 6 min sem `resets_at`, e inferReset em nil por um vao de 115 min na serie
+    /// (app nativo fechado). As quatro fontes tinham numero e nenhuma tinha agenda;
+    /// a barra mostrava "100%" sem relogio ate alguem abrir o painel, porque abrir
+    /// e o unico caminho que ja passava por cima da economia (panelDidOpen forca).
+    ///
+    /// Nao vira polling: quem nao tem data volta apenas ao ritmo normal de 300s com
+    /// jitter, e o backoff de 429 continua acima disto.
+    ///
+    /// Uso zerado conta como resolvido, e essa metade tambem custou uma medicao:
+    /// com 0% a janela de 5h ainda nem comecou -- ela ancora no primeiro uso --
+    /// entao nao existe data nenhuma para buscar, e a barra sem relogio ali e a
+    /// verdade. Sem esta clausula, uma maquina parada (que fica em 0% por horas, a
+    /// noite inteira) voltaria a poleiar de 300 em 300s para sempre atras de um
+    /// campo que ninguem tem. Visto no teste da propria correcao: a janela virou no
+    /// meio dele e a API passou a ser consultada a cada ciclo, sem nada a ganhar.
+    private func countdownSettled(_ accountID: String) -> Bool {
+        guard let five = accounts.first(where: { $0.id == accountID })?.usage.fiveHour
+        else { return false }
+        if five.pct == 0 { return true }
+        guard let reset = five.resetsAt else { return false }
+        return reset > Date()
+    }
+
     /// `force` e o clique: abrir o painel ou apertar Atualizar passa por cima do
     /// agendamento e da economia abaixo, mas nunca por cima de um 429 (quem
     /// chama e que decide isso) nem de um fetch ja em voo.
@@ -1409,8 +1452,13 @@ final class Store: ObservableObject {
         // nao melhoraria numero nenhum -- so aumentaria a chance de 429. Fechou o
         // app nativo (ou nunca foi instalado), a serie envelhece e o poller volta
         // sozinho no ciclo seguinte.
+        //
+        // "Nao melhoraria numero nenhum" tem uma excecao, e ela custou um sintoma:
+        // o historico so carrega porcentagem. Sem countdown publicado, a API ainda
+        // tem o que trazer -- e era justamente ela que esta economia calava.
         if !force, let at = sources[target.id]?.history.at,
-           Date().timeIntervalSince(at) < K.passiveFresh {
+           Date().timeIntervalSince(at) < K.passiveFresh,
+           countdownSettled(target.id) {
             scheduleNextFetch(K.apiInterval)
             return
         }
@@ -2908,6 +2956,11 @@ struct LimitBar: View {
             if let l = limit {
                 if l.rolledOver {
                     Text("janela reiniciada").font(.caption2).foregroundStyle(.secondary)
+                } else if l.pct == 0, l.resetsAt == nil {
+                    // O terceiro estado, que antes nao tinha legenda nenhuma: a
+                    // janela nao comecou. Silencio aqui parecia dado faltando.
+                    Text("janela começa no próximo uso")
+                        .font(.caption2).foregroundStyle(.secondary)
                 } else if let r = l.resetsAt {
                     // O "~" nao e enfeite: a data deduzida erra minutos, e um
                     // countdown ao segundo sem ele prometeria precisao que nao
