@@ -38,11 +38,48 @@ PLIST
 
 ARCH="$(uname -m)"   # arm64 ou x86_64
 
+# Qual SDK usar. O padrao, quase sempre -- mas nao quando ele e mais novo que a
+# toolchain instalada.
+#
+# O SwiftUI do SDK 27 declara @State como *macro*, e quem expande macro e um
+# plugin (libSwiftUIMacros.dylib) que so vem com o Xcode completo: os Command
+# Line Tools sozinhos nao o trazem. Numa maquina so com CLT, compilar contra o
+# SDK mais novo morre em "plugin for module 'SwiftUIMacros' not found" -- em
+# codigo que compilava na semana passada, porque quem mudou foi a ferramenta.
+# Nesse caso caimos para o SDK mais novo que ainda compile, onde @State e um
+# property wrapper comum. Com Xcode instalado o probe passa de primeira e nada
+# disso acontece.
+#
+# O probe custa 0.35s e evita descobrir o problema depois de dez segundos de
+# compilacao do app inteiro.
+SDK_FLAGS=()
+PROBE="$(mktemp -t claudebar-probe)"; PROBE="$PROBE.swift"
+printf 'import SwiftUI\nstruct Probe: View {\n  @State private var x = 0\n  var body: some View { Text("\\(x)") }\n}\n' > "$PROBE"
+probe_ok() { swiftc -typecheck -parse-as-library -target "${ARCH}-apple-macos${MIN_MACOS}" "$@" "$PROBE" 2>/dev/null; }
+
+if ! probe_ok; then
+  for sdk in $(ls -d "$(xcode-select -p)"/SDKs/MacOSX*.sdk 2>/dev/null | sort -rV); do
+    if probe_ok -sdk "$sdk"; then
+      SDK_FLAGS=(-sdk "$sdk")
+      echo "SDK padrao sem plugin de macro do SwiftUI; usando $(basename "$sdk")."
+      break
+    fi
+  done
+  if [ ${#SDK_FLAGS[@]} -eq 0 ]; then
+    rm -f "$PROBE"
+    echo "Nenhum SDK disponivel compila SwiftUI nesta maquina." >&2
+    echo "Instale o Xcode (ou reinstale os Command Line Tools) e rode de novo." >&2
+    exit 1
+  fi
+fi
+rm -f "$PROBE"
+
 echo "Compilando (${ARCH}, macOS ${MIN_MACOS}+)..."
 # -parse-as-library: sem isso, um .swift unico compila em modo script e o @main
 # e rejeitado ("'main' attribute cannot be used in a module that contains top-level code").
 swiftc -O -parse-as-library \
   -target "${ARCH}-apple-macos${MIN_MACOS}" \
+  "${SDK_FLAGS[@]}" \
   -framework SwiftUI -framework AppKit \
   -o "$BIN_DIR/ClaudeBarLocal" \
   ClaudeBarLocal.swift
