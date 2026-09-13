@@ -4,7 +4,9 @@ hook.py — registra o estado de cada sessao do Claude Code em disco.
 
 Um unico script atende varios eventos. Ele le o JSON do stdin, olha o campo
 hook_event_name e grava o estado da sessao em
-~/.claude/claude-bar/sessions/<session_id>.json.
+<config dir>/claude-bar/sessions/<session_id>.json -- onde <config dir> e o
+CLAUDE_CONFIG_DIR desta sessao (~/.claude quando nao ha um), para que cada conta
+do Claude Code tenha o seu. Ver state_dir() abaixo.
 
 Ele NAO decide nada: nunca imprime permissionDecision, nunca sai com codigo 2.
 Sai sempre 0. Se quebrar, o Claude Code segue normal.
@@ -35,7 +37,22 @@ import os
 import sys
 import time
 
-STATE_DIR = os.path.expanduser("~/.claude/claude-bar")
+
+def state_dir():
+    """Diretorio de estado desta conta: <config dir do Claude Code>/claude-bar.
+
+    Cada conta vive num CLAUDE_CONFIG_DIR proprio (a padrao e ~/.claude), e o
+    estado segue essa divisao em vez de um diretorio unico e compartilhado. Nao e
+    organizacao: e o que impede o uso de uma conta sobrescrever o da outra no
+    mesmo usage.json, o DEBUG de uma capturar conversa da outra, e desinstalar
+    uma conta levar junto o estado das demais. O app acha as contas pelo mesmo
+    caminho -- ver Accounts.discover no ClaudeBarLocal.swift.
+    """
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR", "").strip() or "~/.claude"
+    return os.path.join(os.path.expanduser(cfg), "claude-bar")
+
+
+STATE_DIR = state_dir()
 SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
 DEBUG_FLAG = os.path.join(STATE_DIR, "DEBUG")
 DEBUG_LOG = os.path.join(STATE_DIR, "debug.jsonl")
@@ -69,7 +86,11 @@ def atomic_write(path, payload):
 
 
 def debug_dump(raw):
-    """Se ~/.claude/claude-bar/DEBUG existir, apenda o stdin cru para inspecao.
+    """Se <config dir>/claude-bar/DEBUG existir, apenda o stdin cru para inspecao.
+
+    A flag e por conta, e nao global, de proposito: ligar o diagnostico numa
+    conta nao pode fazer o stdin cru de outra -- que carrega conteudo de sessao --
+    parar no mesmo arquivo.
 
     Flag por arquivo em vez de env var: hooks nao herdam ambiente de shell de
     forma confiavel, e um touch/rm liga e desliga.

@@ -3,10 +3,14 @@
 statusline.py — statusline do Claude Code + bomba de dados para a menu bar.
 
 Lê o JSON que o Claude Code manda no stdin, grava um snapshot em
-~/.claude/claude-bar/usage.json e imprime uma linha para o terminal.
+<config dir>/claude-bar/usage.json e imprime uma linha para o terminal.
+
+O <config dir> e o CLAUDE_CONFIG_DIR desta sessao (~/.claude quando nao ha um),
+entao cada conta do Claude Code escreve no seu proprio diretorio -- ver
+state_dir() logo abaixo.
 
 NAO faz chamada de rede. NAO le credencial. NAO escreve fora de
-~/.claude/claude-bar/. Sai com 0 em qualquer situacao para nunca
+<config dir>/claude-bar/. Sai com 0 em qualquer situacao para nunca
 derrubar a statusline.
 """
 
@@ -15,7 +19,22 @@ import os
 import sys
 import time
 
-STATE_DIR = os.path.expanduser("~/.claude/claude-bar")
+
+def state_dir():
+    """Diretorio de estado desta conta: <config dir do Claude Code>/claude-bar.
+
+    Cada conta vive num CLAUDE_CONFIG_DIR proprio (a padrao e ~/.claude), e o
+    estado segue essa divisao em vez de um diretorio unico e compartilhado. Nao e
+    organizacao: e o que impede o uso de uma conta sobrescrever o da outra no
+    mesmo usage.json, o DEBUG de uma capturar conversa da outra, e desinstalar
+    uma conta levar junto o estado das demais. O app acha as contas pelo mesmo
+    caminho -- ver Accounts.discover no ClaudeBarLocal.swift.
+    """
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR", "").strip() or "~/.claude"
+    return os.path.join(os.path.expanduser(cfg), "claude-bar")
+
+
+STATE_DIR = state_dir()
 USAGE_FILE = os.path.join(STATE_DIR, "usage.json")
 SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
 DEBUG_FLAG = os.path.join(STATE_DIR, "DEBUG")
@@ -51,7 +70,12 @@ def atomic_write(path, payload):
 
 
 def debug_dump(raw):
-    """Se ~/.claude/claude-bar/DEBUG existir, apenda o stdin cru para inspecao."""
+    """Se <config dir>/claude-bar/DEBUG existir, apenda o stdin cru para inspecao.
+
+    A flag e por conta, e nao global, de proposito: ligar o diagnostico numa
+    conta nao pode fazer o stdin cru de outra -- que carrega conteudo de sessao --
+    parar no mesmo arquivo.
+    """
     try:
         if not os.path.exists(DEBUG_FLAG):
             return
